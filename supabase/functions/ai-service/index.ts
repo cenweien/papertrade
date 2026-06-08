@@ -13,9 +13,10 @@ const corsHeaders = {
 };
 
 // Secrets — set these in Supabase Edge Function config:
-//   MINIMAX_API_KEY           (required)
-//   SUPABASE_URL              (auto-provided by Supabase)
-//   SUPABASE_SERVICE_ROLE_KEY (auto-provided by Supabase)
+//   MINIMAX_API_KEY  (required) — your MiniMax API key
+//   SUPABASE_URL     (auto-provided by Supabase, do not set manually)
+//   SERVICE_KEY      (required) — a Secret Key from Settings → API → Secret keys
+//                                 (the SUPABASE_ prefix is reserved by Supabase)
 const MINIMAX_API_KEY = Deno.env.get('MINIMAX_API_KEY');
 const MINIMAX_MODEL = 'MiniMax-2-7-highspeed'; // lightweight, fast
 const MINIMAX_API_URL = 'https://api.MiniMax.chat/v1/chat/completions';
@@ -39,9 +40,10 @@ serve(async (req: Request) => {
 
     // Supabase auto-injects SUPABASE_URL. We use a Secret Key (new system) for
     // privileged access — create one in Settings → API → Secret keys and add it
-    // as an env var named SUPABASE_SECRET_KEY in the function's secrets.
+    // as an env var in the function's secrets. NOTE: Supabase reserves the
+    // SUPABASE_ prefix for its own auto-injected vars, so we use SERVICE_KEY.
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SECRET_KEY')!;
+    const supabaseKey = Deno.env.get('SERVICE_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseKey);
 
     const { data: { user } } = await supabase.auth.getUser(token);
