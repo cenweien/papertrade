@@ -37,9 +37,11 @@ serve(async (req: Request) => {
 
     const token = authHeader.replace('Bearer ', '');
 
-    // Supabase auto-injects these as env vars on every Edge Function
+    // Supabase auto-injects SUPABASE_URL. We use a Secret Key (new system) for
+    // privileged access — create one in Settings → API → Secret keys and add it
+    // as an env var named SUPABASE_SECRET_KEY in the function's secrets.
     const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
-    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+    const supabaseKey = Deno.env.get('SUPABASE_SECRET_KEY')!;
     const supabase = createClient(supabaseUrl, supabaseKey);
 
     const { data: { user } } = await supabase.auth.getUser(token);
