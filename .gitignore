@@ -35,6 +35,9 @@ lerna-debug.log*
 *.swp
 *.swo
 *~
+*.bak
+*.orig
+*.rej
 .DS_Store
 Thumbs.db
 
@@ -47,3 +50,21 @@ coverage/
 .parcel-cache/
 .turbo/
 .tmp/
+.vercel
+.env*
+!.env.example
+
+# ----------------------------------------------------------------------------
+# Bloomberg SAPI integration
+# ----------------------------------------------------------------------------
+# Extracted wheel source - do not commit (install via pip from the .whl)
+xbbg_sapi_extracted/
+# The wheel itself is local-only; do not commit
+xbbg_sapi-*.whl
+# Any Python venv created to install xbbg_sapi or the relay service
+.venv*/
+.venv-bb/
+bloomberg-service/.venv/
+bloomberg-service/.env
+bloomberg-service/**/__pycache__/
+bloomberg-service/**/*.pyc

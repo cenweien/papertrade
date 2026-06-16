@@ -1,0 +1,25 @@
+# Pre-commit secret scanning hook.
+#
+# Installed by .kilo/commands or manually with:
+#   pre-commit install
+#
+# This catches real production secrets (Supabase service keys, bloomberg
+# relay keys, AWS keys, GitHub tokens, etc.) before they enter git
+# history. The `bloomberg-service/.env` file is .gitignored, but a
+# `git add bloomberg-service/` or a Supabase CLI link flow can still
+# exfiltrate secrets — this hook is the last line of defence.
+#
+# We use `gitleaks` (https://github.com/gitleaks/gitleaks) which is a
+# single static binary with no dependencies. Install with:
+#   winget install gitleaks          # Windows
+#   brew install gitleaks            # macOS
+#   apt install gitleaks             # Linux
+#
+# To bypass in an emergency (and accept the risk), use:
+#   git commit --no-verify
+
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks

@@ -157,19 +157,93 @@ export async function getTrades(portfolioId?: string, limit = 100): Promise<Trad
   return data || [];
 }
 
+/**
+ * Resolve the live cached price for a ticker from the instrument_prices
+ * cache. Returns null if no fresh price is available. Used by
+ * executeTrade() to turn a notional into a qty at the moment of
+ * execution, so the system — not the LLM — owns the share-count math.
+ */
+export async function getCachedPrice(ticker: string): Promise<number | null> {
+  const upper = ticker.toUpperCase();
+  const { data, error } = await supabase
+    .from('instrument_prices')
+    .select('current_price, last_updated')
+    .eq('ticker', upper)
+    .maybeSingle();
+  if (error || !data) return null;
+  const ageMs = Date.now() - new Date(data.last_updated).getTime();
+  // 10-minute window: a bit more permissive than the 5-min display
+  // TTL because the user might be about to execute and we want a
+  // sensible fallback even if the price is mildly stale.
+  if (ageMs > 10 * 60 * 1000) return null;
+  return data.current_price ?? null;
+}
+
+/**
+ * Execute a trade. Supports both LONG (BUY/SELL closes) and SHORT
+ * (SELL opens, BUY covers) directions, and resolves notional -> qty
+ * at execution time using the latest cached price.
+ *
+ * The caller may pass either `qty` (share count) or `notional` (USD
+ * dollars). Resolution priority: explicit `qty` wins; if only `notional`
+ * is given, it's divided by the freshest cached price to get a whole
+ * share count. `price` is recorded as the fill price; for market
+ * orders it should be the same as the cached price the qty was
+ * computed from.
+ */
 export async function executeTrade(input: {
   portfolio_id: string;
   ticker: string;
   side: 'BUY' | 'SELL';
-  qty: number;
-  price: number;
-  stop_price?: number;
+  direction?: 'LONG' | 'SHORT';
+  qty?: number | null;
+  notional?: number | null;
+  price?: number | null;
+  stop_price?: number | null;
   notes?: string;
+  executed_at?: string;
 }): Promise<Trade> {
   const ticker = input.ticker.toUpperCase();
-  const totalCost = input.qty * input.price;
+  const direction: 'LONG' | 'SHORT' = input.direction ?? 'LONG';
 
-  // 1. Get portfolio
+  // ---- 1. Resolve price & qty ----
+  // 1a. If caller passed a notional but no qty, we need a price to
+  //     convert. Use the cached price (fresh) if available, else the
+  //     caller's explicit price as a last resort.
+  let price: number | null = input.price ?? null;
+  let qty: number | null = input.qty ?? null;
+
+  if (qty == null && input.notional != null && input.notional > 0) {
+    if (price == null || price <= 0) {
+      const cached = await getCachedPrice(ticker);
+      if (cached != null && cached > 0) {
+        price = cached;
+      }
+    }
+    if (price == null || price <= 0) {
+      throw new Error(
+        `Cannot resolve $${input.notional.toLocaleString()} notional for ${ticker}: no market price available. ` +
+        `Specify a limit price or wait for the price cache to warm up.`
+      );
+    }
+    qty = Math.floor(input.notional / price);
+    if (!qty || qty <= 0) {
+      throw new Error(
+        `Notional $${input.notional.toLocaleString()} of ${ticker} is too small to buy 1 share at $${price.toFixed(2)}`
+      );
+    }
+  }
+
+  if (qty == null || qty <= 0) {
+    throw new Error('Quantity is required (pass either `qty` or `notional` plus a price)');
+  }
+  if (price == null || price <= 0) {
+    throw new Error('Price is required');
+  }
+
+  const totalCost = qty * price;
+
+  // ---- 2. Get portfolio ----
   const { data: portfolio, error: pErr } = await supabase
     .from('portfolios')
     .select('*')
@@ -177,54 +251,84 @@ export async function executeTrade(input: {
     .single();
   if (pErr || !portfolio) throw new Error('Portfolio not found');
 
-  // 2. Validate cash for BUY
-  if (input.side === 'BUY' && portfolio.current_capital < totalCost) {
-    throw new Error(
-      `Insufficient cash. Need $${totalCost.toFixed(2)}, have $${portfolio.current_capital.toFixed(2)}`
-    );
-  }
+  // ---- 3. Get the (possibly non-existent) existing position ----
+  const { data: existingPos } = await supabase
+    .from('positions')
+    .select('*')
+    .eq('portfolio_id', input.portfolio_id)
+    .eq('ticker', ticker)
+    .maybeSingle();
 
-  // 3. Validate position for SELL
-  if (input.side === 'SELL') {
-    const { data: pos } = await supabase
-      .from('positions')
-      .select('*')
-      .eq('portfolio_id', input.portfolio_id)
-      .eq('ticker', ticker)
-      .single();
-
-    if (!pos || pos.qty < input.qty) {
+  // ---- 4. Validation by side + direction ----
+  // SELL + LONG  = close long     (need existing long, pos.qty >= qty)
+  // SELL + SHORT = open short     (no existing required; skip cash check; we RECEIVE proceeds)
+  // BUY  + LONG  = open long      (need cash; pos.qty was 0 or already long)
+  // BUY  + SHORT = cover short    (need existing short, -pos.qty >= qty)
+  if (input.side === 'SELL' && direction === 'LONG') {
+    if (!existingPos || existingPos.qty < qty) {
       throw new Error(
-        `Insufficient shares. Need ${input.qty}, have ${pos?.qty || 0}`
+        `Insufficient shares. Need ${qty}, have ${existingPos?.qty ?? 0}`
+      );
+    }
+  } else if (input.side === 'SELL' && direction === 'SHORT') {
+    // Opening a short: no position required, no cash check (paper trading
+    // treats shorts as cash-secured, i.e. you receive the proceeds).
+    // (For real margin trading we'd need a margin check here.)
+  } else if (input.side === 'BUY' && direction === 'LONG') {
+    if (portfolio.current_capital < totalCost) {
+      throw new Error(
+        `Insufficient cash. Need $${totalCost.toFixed(2)}, have $${portfolio.current_capital.toFixed(2)}`
+      );
+    }
+  } else if (input.side === 'BUY' && direction === 'SHORT') {
+    if (!existingPos || existingPos.qty >= 0 || -existingPos.qty < qty) {
+      throw new Error(
+        `Insufficient short position. Need ${qty} to cover, have ${existingPos ? Math.abs(Math.min(0, existingPos.qty)) : 0}`
+      );
+    }
+    if (portfolio.current_capital < totalCost) {
+      throw new Error(
+        `Insufficient cash to cover short. Need $${totalCost.toFixed(2)}, have $${portfolio.current_capital.toFixed(2)}`
       );
     }
   }
 
-  // 4. Insert trade
+  // ---- 5. Insert trade ----
   const { data: trade, error: tErr } = await supabase
     .from('trades')
     .insert({
       portfolio_id: input.portfolio_id,
       ticker,
       side: input.side,
-      qty: input.qty,
-      price: input.price,
-      stop_price: input.stop_price || null,
-      notes: input.notes || null,
+      direction,
+      qty,
+      price,
+      stop_price: input.stop_price ?? null,
+      notes: input.notes ?? null,
+      executed_at: input.executed_at ?? new Date().toISOString(),
     })
     .select()
     .single();
   if (tErr) throw tErr;
 
-  // 5. Update portfolio cash
+  // ---- 6. Update portfolio cash. Cash flow follows SIDE, not direction:
+  //     BUY pays out; SELL receives. This is true for both opening and
+  //     closing trades, longs and shorts alike.
   const cashDelta = input.side === 'BUY' ? -totalCost : totalCost;
   await supabase
     .from('portfolios')
     .update({ current_capital: portfolio.current_capital + cashDelta })
     .eq('id', input.portfolio_id);
 
-  // 6. Update position
-  await updatePositionAfterTrade(input.portfolio_id, ticker, input.side, input.qty, input.price);
+  // ---- 7. Update position (signed qty, signed-aware average price) ----
+  await updatePositionAfterTrade(
+    input.portfolio_id,
+    ticker,
+    input.side,
+    direction,
+    qty,
+    price,
+  );
 
   return trade;
 }
@@ -233,38 +337,79 @@ async function updatePositionAfterTrade(
   portfolioId: string,
   ticker: string,
   side: 'BUY' | 'SELL',
+  direction: 'LONG' | 'SHORT',
   qty: number,
-  price: number
+  price: number,
 ): Promise<void> {
   const { data: existing } = await supabase
     .from('positions')
     .select('*')
     .eq('portfolio_id', portfolioId)
     .eq('ticker', ticker)
-    .single();
+    .maybeSingle();
 
-  if (side === 'BUY') {
+  // Signed qty delta. Opening a short makes qty more negative; covering
+  // makes it less negative; longs behave as before.
+  const signedDelta =
+    side === 'BUY'
+      ? qty                       // BUY: +qty to position (long add or cover short)
+      : -qty;                     // SELL: -qty from position (close long or open short)
+  const newQty = (existing?.qty ?? 0) + signedDelta;
+
+  if (newQty === 0) {
     if (existing) {
-      const newQty = existing.qty + qty;
-      const newAvgPrice = (existing.qty * existing.avg_price + qty * price) / newQty;
-      await supabase
-        .from('positions')
-        .update({ qty: newQty, avg_price: newAvgPrice })
-        .eq('id', existing.id);
+      await supabase.from('positions').delete().eq('id', existing.id);
+    }
+    return;
+  }
+
+  // Average price is the cost basis. For LONG adds: weighted average.
+  // For SHORT opens: the short proceeds become the basis. For closes
+  // (either side) and covers, the basis is preserved (no re-average).
+  let newAvgPrice: number;
+  if (existing) {
+    const wasLong = existing.qty > 0;
+    const wasShort = existing.qty < 0;
+    const openingLong = direction === 'LONG' && side === 'BUY' && !wasLong;
+    const addingToLong = direction === 'LONG' && side === 'BUY' && wasLong;
+    const openingShort = direction === 'SHORT' && side === 'SELL' && !wasShort;
+    const addingToShort = direction === 'SHORT' && side === 'SELL' && wasShort;
+
+    if (openingLong) {
+      // Was 0 (or didn't exist); new basis = fill price.
+      newAvgPrice = price;
+    } else if (addingToLong) {
+      // Weighted average of existing long cost basis + this fill.
+      const cost = existing.qty * existing.avg_price + qty * price;
+      newAvgPrice = cost / newQty;
+    } else if (openingShort) {
+      // First short entry: basis = fill price (the proceeds price).
+      newAvgPrice = price;
+    } else if (addingToShort) {
+      // Adding to an existing short. existing.qty is negative; abs() it
+      // for the weighted-average math.
+      const existingAbs = Math.abs(existing.qty);
+      const cost = existingAbs * existing.avg_price + qty * price;
+      newAvgPrice = cost / (existingAbs + qty);
     } else {
-      await supabase
-        .from('positions')
-        .insert({ portfolio_id: portfolioId, ticker, qty, avg_price: price });
+      // Closing or covering: basis is preserved. (Real accounting
+      // would realize P&L into the basis; for paper trading we keep
+      // the running avg so the unrealized P&L display is sensible.)
+      newAvgPrice = existing.avg_price;
     }
   } else {
-    if (existing) {
-      const newQty = existing.qty - qty;
-      if (newQty <= 0) {
-        await supabase.from('positions').delete().eq('id', existing.id);
-      } else {
-        await supabase.from('positions').update({ qty: newQty }).eq('id', existing.id);
-      }
-    }
+    newAvgPrice = price;
+  }
+
+  if (existing) {
+    await supabase
+      .from('positions')
+      .update({ qty: newQty, avg_price: newAvgPrice })
+      .eq('id', existing.id);
+  } else {
+    await supabase
+      .from('positions')
+      .insert({ portfolio_id: portfolioId, ticker, qty: newQty, avg_price: newAvgPrice });
   }
 }
 

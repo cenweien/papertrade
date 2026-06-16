@@ -43,6 +43,7 @@ export interface Database {
           portfolio_id: string;
           ticker: string;
           side: 'BUY' | 'SELL';
+          direction: 'LONG' | 'SHORT';
           qty: number;
           price: number;
           total_value: number;
@@ -53,7 +54,9 @@ export interface Database {
           notes: string | null;
           created_at: string;
         };
-        Insert: Omit<Database['public']['Tables']['trades']['Row'], 'id' | 'total_value' | 'created_at'>;
+        Insert: Omit<Database['public']['Tables']['trades']['Row'], 'id' | 'total_value' | 'created_at' | 'direction'> & {
+          direction?: 'LONG' | 'SHORT';
+        };
         Update: Partial<Database['public']['Tables']['trades']['Row']>;
       };
       positions: {
@@ -106,3 +109,29 @@ export type Portfolio = Database['public']['Tables']['portfolios']['Row'];
 export type Trade = Database['public']['Tables']['trades']['Row'];
 export type Position = Database['public']['Tables']['positions']['Row'];
 export type DailySnapshot = Database['public']['Tables']['daily_snapshots']['Row'];
+
+// instrument_prices table (renamed from stock_prices in migration
+// 005_instrument_universe.sql). The shape is backwards-compatible —
+// every existing field is still present — with new optional metadata
+// for non-equity asset classes.
+export interface InstrumentPrice {
+  ticker: string;
+  current_price: number;
+  previous_close: number | null;
+  change_pct: number | null;
+  day_high: number | null;
+  day_low: number | null;
+  day_open: number | null;
+  volume: number | null;
+  company_name: string | null;
+  sector: string | null;
+  asset_class: 'EQUITY' | 'ETF' | 'FUTURE' | 'FX' | 'BOND' | 'OPTION' | 'INDEX' | 'CRYPTO' | 'MUTUAL_FUND';
+  bbg_symbol: string | null;
+  contract_size: number | null;
+  currency: string | null;
+  expiry_date: string | null;
+  last_updated: string;
+}
+
+// Backwards-compat alias: older imports used StockPrice.
+export type StockPrice = InstrumentPrice;

@@ -1,0 +1,31 @@
+# Bloomberg Relay Service dependencies
+# Install with: pip install -r requirements.txt
+# Then install the wheel: pip install ../xbbg_sapi-1.0.0-py3-none-any.whl
+
+# Web framework
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+pydantic>=2.0.0
+
+# .env file loading (reads RELAY_API_KEY, SUPABASE_SERVICE_KEY, etc.
+# from bloomberg-service/.env at startup). In production, env vars are
+# set by the deployment system and load_dotenv() is a no-op.
+python-dotenv>=1.0.0
+
+# Bloomberg SAPI (provided by the firm)
+# pip install ../xbbg_sapi-1.0.0-py3-none-any.whl
+# (Listed as a comment since it's a local wheel, not on PyPI.)
+# xbbg_sapi==1.0.0
+
+# Bloomberg's native SDK - install separately per the firm's instructions
+# (blpapi is not on PyPI as a free package; you may need an internal index)
+# blpapi>=3.17.0
+
+# Supabase client (for scheduler.py)
+supabase>=2.0.0
+
+# Already in xbbg_sapi's deps but we list them for direct scheduler imports
+pandas>=1.5.0
+numpy>=1.21.0
+pytz>=2020.1
+python-dateutil>=2.8.0
