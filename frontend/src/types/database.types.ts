@@ -48,6 +48,12 @@ export interface Database {
           price: number;
           total_value: number;
           trade_timestamp: string;
+          // User-named historical date for the trade (e.g. when the
+          // AI assistant parsed "buy NVDA 3 days ago"). Defaults to
+          // NOW() if no historical date was given. The frontend
+          // displays this for "Date" in Recent Trades; trade_timestamp
+          // is the row-write moment and stays as the audit trail.
+          executed_at: string;
           stop_price: number | null;
           status: 'OPEN' | 'CLOSED' | 'CANCELLED';
           pnl: number | null;
@@ -82,6 +88,16 @@ export interface Database {
           exposure: number;
           cash: number;
           daily_return: number | null;
+          // L/S decomposition (added in migration 006)
+          long_value: number;
+          short_value: number;
+          net_value: number;
+          long_pct: number | null;
+          short_pct: number | null;
+          net_pct: number | null;
+          gross_pct: number | null;
+          sector_jsonb: Record<string, any> | null;
+          position_jsonb: Record<string, any> | null;
           created_at: string;
         };
         Insert: Omit<Database['public']['Tables']['daily_snapshots']['Row'], 'id' | 'created_at'>;

@@ -93,5 +93,3 @@ $$ LANGUAGE sql STABLE;
 -- 2. Set the FINNHUB_API_KEY secret in Supabase:
 --      supabase secrets set FINNHUB_API_KEY=your_key
 -- 3. The market-data function will auto-populate this table on first quote request.
-</content>
-</invoke>

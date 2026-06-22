@@ -39,6 +39,7 @@
 import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
 import { supabaseAdmin } from '../_shared/db.ts';
 import { getUserFromRequest, checkOrigin } from '../_shared/auth.ts';
+import { jsonResponse, handleOptions } from '../_shared/cors.ts';
 
 // =====================================================================
 // 1. Config  (env-driven - no magic constants)
@@ -113,35 +114,127 @@ const STOPWORDS = new Set([
 // 2. Types
 // =====================================================================
 
+// =====================================================================
+// 2. Types
+//
+// Canonical model: a parsed command is an ordered list of `legs`.
+// Every leg is fully self-describing (verb, ticker, qty/notional,
+// price_type, limit_price, stop_loss_pct, trade_date, time_of_day).
+// There is no global action/ticker/date anymore — single-ticker
+// commands are simply a 1-element legs array.
+//
+// This makes "buy AAPL short TSLA 3 days ago" or
+// "buy AAPL yesterday at open, short TSLA last week" expressible
+// directly, and prevents the LLM from hallucinating a global ticker
+// (the SPCX→SPCE class of bug).
+// =====================================================================
+
+export type LegAction = 'BUY' | 'SELL' | 'CLOSE' | 'SHORT' | 'COVER';
+export type LegDirection = 'LONG' | 'SHORT';
+export type PriceType = 'MARKET' | 'LIMIT' | 'STOP';
+export type TimeOfDay = 'pre' | 'open' | 'regular' | 'close' | 'post' | 'eod';
+// How the user expressed the dollar size of this leg. The system
+// resolves anything other than USD into a USD notional at execute
+// time using the live portfolio state (so the LLM never has to
+// guess a share count from a percentage).
+//
+//   USD                — explicit $X / X dollars / Xk worth
+//   PCT_PORTFOLIO      — "10% of my portfolio" / "10% of equity / NAV / holdings"
+//   PCT_CASH           — "10% of my cash"
+//   FRACTION_PORTFOLIO — "half my portfolio" / "a quarter of equity"
+//   FRACTION_CASH      — "half my cash" / "a quarter of available cash"
+export type NotionalBasis =
+  | 'USD'
+  | 'PCT_PORTFOLIO'
+  | 'PCT_CASH'
+  | 'FRACTION_PORTFOLIO'
+  | 'FRACTION_CASH';
+
+interface ParsedLeg {
+  // The verb that applies to THIS ticker. The LLM commits to this
+  // directly in its `legs` output (no global action to override).
+  action: LegAction;
+  direction: LegDirection;
+  ticker: string;
+  // Share count, "ALL", "HALF", or null when the user spoke in USD.
+  qty: number | string | null;
+  // USD amount the user wants to spend on this leg. Null when qty
+  // was given. The system resolves notional -> qty at execute time.
+  notional: number | null;
+  // How `notional` (or the leg's dollar size) was specified. Defaults
+  // to 'USD'. See NotionalBasis docs above for the full list.
+  notional_basis: NotionalBasis;
+  // Percentage (0-100) when basis is PCT_*. Null otherwise.
+  // Example: "10% of my portfolio" -> notional_pct: 10.
+  notional_pct: number | null;
+  // Fraction (0-1) when basis is FRACTION_*. Null otherwise.
+  // Example: "half my portfolio" -> notional_fraction: 0.5.
+  notional_fraction: number | null;
+  price_type: PriceType;
+  limit_price: number | null;
+  stop_loss_pct: number | null;
+  // YYYY-MM-DD, or null if "now". Per-leg so a single command can
+  // mix "yesterday" and "last week" across tickers.
+  trade_date: string | null;
+  time_of_day: TimeOfDay | null;
+  // Populated server-side after market lookup.
+  market_price: number | null;
+  resolved_price: number | null;
+  // Informational: floor(notional / resolved_price) for notional-based
+  // legs. The authoritative qty is recomputed at execute time, but
+  // seeding this lets the UI display a real share count immediately
+  // (instead of an empty "qty" box) and lets the user edit it before
+  // clicking Execute. Null when qty was given explicitly, or when
+  // we don't yet have a price to divide into the notional.
+  preview_qty: number | null;
+  price_unavailable_reason: string | null;
+  ticker_suggestion: string | null;
+  company_name: string | null;
+  sector: string | null;
+  from_cache: boolean | null;
+}
+
 interface ParsedCommand {
   portfolio_id: string | null;
   portfolio_name: string | null;
-  action: 'BUY' | 'SELL' | 'CLOSE' | 'SHORT' | 'COVER';
-  direction: 'LONG' | 'SHORT';
-  ticker: string | null;
-  qty: number | string | null;
-  price_type: 'MARKET' | 'LIMIT' | 'STOP';
-  limit_price: number | null;
-  stop_loss_pct: number | null;
+  // Canonical. Always non-null and >= 1 element after validation.
+  // A "Buy 100 AAPL" command produces [{ action: 'BUY', ticker: 'AAPL', qty: 100, ... }].
+  legs: ParsedLeg[];
+  // Aggregate flags. `is_historical` is true if ANY leg has a
+  // trade_date in the past. The LLM never sets these — the system
+  // derives them.
+  is_historical: boolean;
+  // Self-rated 0-1 confidence. LLM supplies; system uses it to
+  // gate the self-critique step and to badge the UI.
   confidence: number;
   needs_confirmation: boolean;
   explanation: string;
   original_command: string;
-  trade_date: string | null;
-  is_historical: boolean;
-  // Intraday session tag: "at the open" -> 'open', "pre-market" -> 'pre',
-  // "at close" -> 'close', "after hours" -> 'post', etc. null if the
-  // user didn't specify one.
-  time_of_day: 'pre' | 'open' | 'regular' | 'close' | 'post' | 'eod' | null;
-  // Notional (USD) when the user spoke in dollars ("$50k of AAPL",
-  // "1 million of NVDA worth $200"). The system — not the LLM —
-  // resolves notional to qty at execution time using the freshest
-  // cached price. Null if the user gave a share count instead.
-  notional: number | null;
-  // Informational only: how many shares the system would buy at the
-  // current price. The frontend shows it for transparency but the
-  // authoritative qty is recomputed by executeTrade() at click time.
+  // Informational only: total shares the notional would buy at the
+  // current price across all notional-based legs. The authoritative
+  // qty is recomputed at click time by executeTrade().
   preview_qty: number | null;
+  // Convenience: market context line for the primary (first) leg.
+  // The per-leg `market_price` / `resolved_price` are the
+  // authoritative numbers; this is just for the chat-bubble header.
+  market_context: string;
+  // Below: legacy fields the frontend still reads. They mirror the
+  // first leg so single-ticker commands keep working without a
+  // frontend refactor. Multi-leg commands ALSO populate them with
+  // the first leg's data; the frontend should prefer `legs[]`.
+  // (Will be removed once the frontend migration lands.)
+  action: LegAction;
+  direction: LegDirection;
+  ticker: string | null;
+  qty: number | string | null;
+  price_type: PriceType;
+  limit_price: number | null;
+  stop_loss_pct: number | null;
+  trade_date: string | null;
+  time_of_day: TimeOfDay | null;
+  notional: number | null;
+  ticker_suggestion: string | null;
+  price_unavailable_reason: string | null;
 }
 
 interface MarketQuote {
@@ -298,6 +391,186 @@ const COMPANY_TO_TICKER: Record<string, string> = {
 };
 
 // =====================================================================
+// 2e. Known tickers (fuzzy-correction + LLM disambiguation hint)
+//
+// A curated list of well-known US-listed tickers (equities + ETFs +
+// the most-traded futures). Used to:
+//   1. Suggest a correction when the user mistypes a ticker (e.g.
+//      "APPL" -> "AAPL") via Levenshtein distance.
+//   2. Hand the LLM a hint of the valid ticker space so it can pick
+//      from real symbols rather than inventing nonsense.
+//
+// The list is intentionally compact (~250 entries) so the function
+// bundle stays under 1MB. Coverage targets the top 200 S&P 500 names,
+// major ETFs, and the most-traded CME futures. Anything outside this
+// list is still allowed (resolveTicker and the LLM both pass it
+// through) — the list is a hint, not a gate.
+// =====================================================================
+
+const KNOWN_TICKERS: ReadonlySet<string> = new Set([
+  // Mega-cap US equities (S&P 50 + a few popular names)
+  'AAPL','MSFT','GOOGL','GOOG','AMZN','META','NVDA','TSLA','BRK.B','BRK.B',
+  'UNH','XOM','JNJ','JPM','V','MA','PG','HD','CVX','AVGO','LLY','ABBV','PFE',
+  'KO','PEP','COST','WMT','MRK','DIS','CSCO','ACN','TMO','ABT','CRM','VZ',
+  'NKE','ADBE','NFLX','INTC','AMD','QCOM','TXN','HON','IBM','GS','MS','WFC',
+  'BA','CAT','GE','GM','F','TM','HMC','NVS','AZN','ASML','TSM','BABA','PDD',
+  'ORCL','SAP','SHOP','UBER','LYFT','ABNB','SNAP','PINS','RBLX','SPOT','SQ',
+  'PYPL','COIN','HOOD','SOFI','PLTR','SNOW','CRWD','NET','DDOG','ZS','PANW',
+  'FTNT','OKTA','MDB','TEAM','TWLO','DOCU','ZM','ROKU','TTD','AMAT','LRCX',
+  'KLAC','MRVL','MU','WDC','STX','NTAP','SMCI','ARM','DELL','HPQ','HPE',
+  'CSX','UNP','NSC','FDX','UPS','DAL','UAL','AAL','LUV','JBLU','RCL','NCLH',
+  'MAR','HLT','MGM','WYNN','LVS','CZR','DKNG','PENN','DPZ','CMG','YUM','DPZ',
+  'SBUX','MCD','CMG','WEN','DPZ','TXRH','CAKE','EAT','DRI','BLMN','TXRH',
+  'OXY','SLB','BKR','HAL','DVN','EOG','PXD','COP','PSX','VLO','MPC','KMI',
+  'WMB','OKE','EPD','ENB','TRP','PAA','MPLX','NEE','DUK','SO','D','AEP','EXC',
+  'XEL','SRE','WEC','ED','PEG','ES','AWK','ATO','CMS','CNP','DTE','EIX','ETR',
+  'FE','NI','OGE','PNW','PPL','XEL','VST','CEG','NRG','AES','NEE','BEP','NEP',
+  'MO','PM','BTI','UL','STZ','DEO','BUD','TAP','SAM','CCU','FIBR','VICI','GLPI',
+  'PLD','AMT','EQIX','DLR','PSA','O','WPC','VICI','SPG','REG','FRT','KIM','MAC',
+  'AVB','EQR','ESS','MAA','CPT','UDR','CPT','AIRC','AMH','INVH','NXRT','EPRT',
+  'JNPR','CIEN','NOK','ERIC','ADTRAN','LITE','OCLR','COMM','IIVI','AAOI','FNSR',
+  'GTLB','PD','FROG','ESTC','S','MDB','CFLT','SUMO','PRGS','MANH','CDW','GWW',
+  'FAST','POOL','WCC','WSM','RH','BBY','ANF','URBN','GPS','M','KSS','JWN','DKS',
+  'TGT','DG','DLTR','FIVE','OLLI','W','CHWY','CHEWY','PETS','WOOF','BMO','BNS',
+  'TD','RBC','USB','PNC','TFC','KEY','CFG','RF','CFG','FITB','HBAN','MTB','ZION',
+  'C','BAC','WFC','JPM','GS','MS','BLK','SCHW','ETFC','AMTD','RJF','SF','LPLA',
+  'HOOD','IBKR','MKTX','TW','VIRT','COHR','LPL','LM','NMR','RVTY','TMO','DHR',
+  'A','ABT','BAX','BDX','BSX','MDT','SYK','ZBH','STE','TFX','HOLX','ALGN','TXRH',
+  'EW','BSX','MDT','SYK','ZBH','STE','HOLX','BAX','BDX','VAR','VREX','TMDX','GKOS',
+  'PODD','ROLL','WCC','RBC','AIT','FAST','POOL','WSC','WSM','GWW','HEI','TDY',
+  'HUBB','AIT','FERG','BLDR','SUM','OC','VMC','MLI','MHO','PHM','DHI','LEN','KBH',
+  'TOL','MTH','TMHC','CCS','GRBK','HOV','MDC','BZH','TPH','DFH','MHO','OC','VMC',
+  // Major ETFs
+  'SPY','QQQ','IWM','DIA','VOO','VTI','VEA','VWO','EFA','EEM','IEFA','IEMG',
+  'AGG','BND','TLT','SHY','IEF','BIL','GLD','SLV','IAU','USO','UNG','DBC','DBA',
+  'VNQ','IYR','XLK','XLF','XLE','XLV','XLY','XLP','XLI','XLU','XLB','XLC','XLRE',
+  'JETS','KOMP','SOXX','SMH','IBB','XBI','ARKW','ARKK','ARKF','ARKG','ARKQ','ARKX',
+  'HYG','LQD','MUB','TIP','BKLN','JNK','EMB','CWB','FXE','FXY','FXB','FXA','FXC',
+  'UPRO','TQQQ','SQQQ','SPXS','SPXL','SOXL','SOXS','TNA','TZA','FAS','FAZ','TECL',
+  'TECS','UVXY','SVXY','VXX','VIXY','BTAL','BTCO','BITO','GBTC','ETHE','ETCG','ETHE',
+  // Futures (CME most-traded)
+  'ES','NQ','YM','RTY','CL','GC','SI','HG','NG','ZN','ZB','ZF','ZT','6E','6B',
+  '6J','6A','6C','6S','6M','6N','6R','E7','B7','J7','A7','S7','C7','MES','MNQ',
+  'MYM','M2K','MCL','MGC','MSI','MHG','MNG','MZN','MZB','MZF','MZT','M6E','M6B',
+  // Crypto-adjacent equities (proxies)
+  'MSTR','COIN','RIOT','MARA','HUT','CLSK','BTBT','CAN','IREN','CORZ','CIFR','WULF',
+  // Popular SPACs, recent IPOs, and sector plays
+  'ARM','DASH','CAVA','Birkenstock','BIRK','KVUE','ODD','PYCR','PATH','RSI','MSGE',
+  'CROX','CELH','ELF','GLOB','FROG','BROS','CAKE','DUOL','SOFI','OPEN','UPST',
+  'AFRM','BMBL','RSVR','GTLB','DOCN','GTLB','PRGS','HCP','VICI','RHP','PK','PEAK',
+  'DOC','HIMS','TDOC','RDFN','OPEN','Z','ZG','RBLX','U','DKNG','PENN','MGM','LVS',
+  // Tickers the LLM commonly confuses with each other (Levenshtein
+  // distance <= 2). Without these, the system can't suggest a
+  // correction when the user mistypes one for the other. Add new
+  // pairs here as they come up. The list is for fuzzy correction
+  // only — it does not gate any ticker from being used.
+  'SPCE','SPCX','SPC','Virgin','SPCE','ASTR','RKLB','PL',
+  'F','GE','GM','FORD','GM','RACE','STLA','TM',
+  'META','MVIS','GOOG','GOOGL','BRK.B',
+]);
+
+/**
+ * Levenshtein distance between two short strings. Iterative O(n*m)
+ * implementation, no allocations beyond two arrays. Used for fuzzy
+ * ticker correction; both inputs are at most ~6 chars so the inner
+ * loop is bounded.
+ */
+function levenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  const prev = new Array<number>(b.length + 1);
+  const curr = new Array<number>(b.length + 1);
+  for (let j = 0; j <= b.length; j++) prev[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a.charCodeAt(i - 1) === b.charCodeAt(j - 1) ? 0 : 1;
+      curr[j] = Math.min(
+        prev[j] + 1,        // deletion
+        curr[j - 1] + 1,    // insertion
+        prev[j - 1] + cost, // substitution
+      );
+    }
+    for (let j = 0; j <= b.length; j++) prev[j] = curr[j];
+  }
+  return prev[b.length];
+}
+
+/**
+ * Find a known ticker close to `ticker`. Returns the closest
+ * match (by Levenshtein distance) if and only if the distance is at
+ * most 2 AND the input has at least 3 characters AND the input isn't
+ * already a known ticker. Returns null otherwise.
+ *
+ * Conservative thresholds: we don't want to "correct" a perfectly
+ * valid niche ticker into a popular one (e.g. user really did mean
+ * rare "ZIM" and we'd never auto-correct that, distance is 2+ to
+ * any popular name).
+ */
+function suggestTickerCorrection(ticker: string): string | null {
+  if (!ticker) return null;
+  const upper = ticker.toUpperCase();
+  if (upper.length < 3) return null;
+  if (KNOWN_TICKERS.has(upper)) return null;
+  let best: { ticker: string; distance: number } | null = null;
+  for (const known of KNOWN_TICKERS) {
+    // Quick length-based filter: a 1-char or 2-char edit is the most
+    // we accept, so the lengths can't differ by more than 2.
+    if (Math.abs(known.length - upper.length) > 2) continue;
+    const d = levenshtein(upper, known);
+    if (d <= 2 && (best == null || d < best.distance)) {
+      best = { ticker: known, distance: d };
+    }
+  }
+  return best ? best.ticker : null;
+}
+
+/**
+ * Split a natural-language command on common multi-ticker
+ * conjunctions and run the single-ticker resolver on each segment.
+ * Returns an ordered array of unique resolved tickers.
+ *
+ * Examples:
+ *   "Buy 100 AAPL and 50 MSFT" -> [AAPL, MSFT]
+ *   "Short NVDA, buy TSLA"     -> [NVDA, TSLA]
+ *   "Buy 100 AAPL"             -> [AAPL]  (single)
+ *   "Buy apple"                -> [AAPL]  (via company map)
+ *
+ * The split is intentionally simple (split on " and ", " & ", " + ",
+ * " , ", or sentence-boundary punctuation that follows a ticker
+ * shape). For everything else, the single-ticker path is used.
+ */
+function resolveAllTickers(command: string): ResolvedTicker[] {
+  const segments: string[] = [];
+  // Split on common conjunctions. We require the conjunction to be
+  // surrounded by spaces to avoid breaking ticker shapes like "BRK.B".
+  const splitRe = / (?:,|and|&|\+|plus) /i;
+  const rawSegments = command.split(splitRe);
+  for (const seg of rawSegments) {
+    const cleaned = seg.trim();
+    if (cleaned) segments.push(cleaned);
+  }
+  const seen = new Set<string>();
+  const out: ResolvedTicker[] = [];
+  for (const seg of segments) {
+    const r = resolveTicker(seg);
+    if (r && !seen.has(r.ticker)) {
+      seen.add(r.ticker);
+      out.push(r);
+    }
+  }
+  // Fallback: if splitting on conjunctions left us with nothing
+  // (the segment split should always produce at least 1), the
+  // single-ticker resolver on the full command is the last resort.
+  if (out.length === 0) {
+    const r = resolveTicker(command);
+    if (r) out.push(r);
+  }
+  return out;
+}
+
+// =====================================================================
 // 3. LLM call  (Gemini function calling, fast & strict)
 // =====================================================================
 
@@ -305,36 +578,61 @@ const COMPANY_TO_TICKER: Record<string, string> = {
  * Function-calling schema for Gemini. The LLM is forced to call this
  * function (or return null), giving the strongest schema guarantees
  * and avoiding the cost/error rate of freeform JSON generation.
+ *
+ * Schema shape: `legs` is the canonical output. The LLM must produce
+ * at least one leg per detected ticker, with each leg carrying its
+ * own action, qty/notional, price_type, date, and time_of_day. There
+ * is no global `action` / `ticker` / `trade_date` field — the
+ * previous design forced mixed-verb commands to overwrite the
+ * per-leg verb with a single global verb (the "Buy A short B only
+ * buys" bug), and the global `ticker` slot was where the LLM
+ * hallucinated similar real tickers (the "SPCX → SPCE" bug).
  */
 const PARSE_TRADE_FUNCTION = {
   name: 'parse_trade',
-  description: 'Extract a structured trade order from the user\'s natural-language command.',
+  description: 'Extract a structured trade order from the user\'s natural-language command. Output an ordered list of legs; every named ticker is its own leg with its own action verb and date.',
   parameters: {
     type: 'object',
     properties: {
       portfolio_id: { type: 'string', nullable: true, description: 'UUID of the portfolio, or null if unspecified.' },
       portfolio_name: { type: 'string', nullable: true, description: 'Name of the portfolio if the user mentioned one.' },
-      action: { type: 'string', enum: ['BUY', 'SELL', 'CLOSE', 'SHORT', 'COVER'] },
-      ticker: { type: 'string', nullable: true, description: 'Symbol, uppercase. Null if not detected.' },
-      qty: {
-        oneOf: [
-          { type: 'number' },
-          { type: 'string', enum: ['ALL', 'HALF'] },
-          { type: 'null' },
-        ],
-        description: 'Share count, or ALL/HALF to mean entire or half of the existing position, or null if not given.',
+      confidence: { type: 'number', description: '0.0-1.0 self-rated confidence across all legs.' },
+      needs_confirmation: { type: 'boolean', description: 'True if any leg is ambiguous.' },
+      explanation: { type: 'string', description: 'Short user-facing explanation of what the command does.' },
+      // One entry per ticker named in the command. Single-ticker
+      // commands produce a 1-element array. The LLM MUST populate
+      // this — there is no fallback `action` / `ticker` slot.
+      legs: {
+        type: 'array',
+        description: 'One entry per ticker. Each leg carries its own verb, qty/notional, price type, and (optional) date.',
+        items: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['BUY', 'SELL', 'CLOSE', 'SHORT', 'COVER'], description: 'Verb for this specific ticker. Mixed verbs ("buy A and short B") are supported.' },
+            ticker: { type: 'string', description: 'Symbol, uppercase. Echo the user\'s input verbatim — do NOT correct typos or substitute a similar-looking ticker.' },
+            // Schema quirk: Gemini's stricter validator chokes on
+            // oneOf/nullable, so we declare qty as a string and
+            // coerce in validateAndNormalize().
+            qty: { type: 'string', nullable: true, description: 'Number (as string), "ALL", "HALF", or null if notional was given.' },
+            notional: { type: 'number', nullable: true, description: 'USD for this leg, or null if qty was given.' },
+            // NEW: how the user expressed the dollar size. The system
+            // resolves non-USD bases at execute time using live
+            // portfolio state (you never have to compute a share count
+            // from a percentage yourself).
+            notional_basis: { type: 'string', enum: ['USD', 'PCT_PORTFOLIO', 'PCT_CASH', 'FRACTION_PORTFOLIO', 'FRACTION_CASH'], nullable: true, description: 'How the user sized this leg. "USD" (default) for $X / X dollars / Xk worth. "PCT_PORTFOLIO" for "10% of my portfolio". "PCT_CASH" for "10% of my cash". "FRACTION_PORTFOLIO" for "half my portfolio" / "a quarter of equity". "FRACTION_CASH" for "half my cash". When you set a non-USD basis, set notional=null and fill notional_pct (0-100) or notional_fraction (0-1) instead.' },
+            notional_pct: { type: 'number', nullable: true, description: 'Percentage 0-100. Set when notional_basis is PCT_PORTFOLIO or PCT_CASH. Leave null otherwise. Example: "10% of my portfolio" -> 10.' },
+            notional_fraction: { type: 'number', nullable: true, description: 'Fraction 0-1. Set when notional_basis is FRACTION_PORTFOLIO or FRACTION_CASH. Leave null otherwise. Example: "half my portfolio" -> 0.5; "a quarter of equity" -> 0.25.' },
+            price_type: { type: 'string', enum: ['MARKET', 'LIMIT', 'STOP'], description: 'Order type for this leg. Defaults to MARKET if unspecified.' },
+            limit_price: { type: 'number', nullable: true },
+            stop_loss_pct: { type: 'number', nullable: true, description: 'Stop-loss as a percent of entry, e.g. 7 means -7%.' },
+            trade_date: { type: 'string', nullable: true, description: 'YYYY-MM-DD if this leg was specified for a past date, else null. "3 days ago" on the whole command sets this on every leg; per-leg dates override.' },
+            time_of_day: { type: 'string', nullable: true, enum: ['pre', 'open', 'regular', 'close', 'post', 'eod'] },
+          },
+          required: ['action', 'ticker'],
+        },
       },
-      notional: { type: 'number', nullable: true, description: 'USD dollar amount the user wants to spend. Null if qty was given.' },
-      price_type: { type: 'string', enum: ['MARKET', 'LIMIT', 'STOP'] },
-      limit_price: { type: 'number', nullable: true },
-      stop_loss_pct: { type: 'number', nullable: true, description: 'Stop-loss as a percent of entry, e.g. 7 means -7%.' },
-      confidence: { type: 'number', description: '0.0-1.0 self-rated confidence.' },
-      needs_confirmation: { type: 'boolean', description: 'True if anything is ambiguous.' },
-      explanation: { type: 'string', description: 'Short user-facing explanation of what the trade does.' },
-      trade_date: { type: 'string', nullable: true, description: 'YYYY-MM-DD if the user named a historical date, else null.' },
-      time_of_day: { type: 'string', nullable: true, enum: ['pre', 'open', 'regular', 'close', 'post', 'eod'] },
     },
-    required: ['action', 'price_type', 'confidence', 'needs_confirmation', 'explanation'],
+    required: ['legs', 'confidence', 'needs_confirmation', 'explanation'],
   },
 };
 
@@ -650,19 +948,21 @@ function detectDate(command: string): string | null {
   if (/\byesterday\b/.test(lower)) return daysAgo(1);
 
   let m: RegExpMatchArray | null;
-  if ((m = lower.match(/(\d+)\s*days?\s*ago/))) return daysAgo(parseInt(m[1]));
-  if ((m = lower.match(/(\d+)\s*weeks?\s*ago/))) return daysAgo(parseInt(m[1]) * 7);
-  if ((m = lower.match(/(\d+)\s*months?\s*ago/))) {
+  // Digit is optional so "a year ago" / "year ago" work the same as "1 year ago".
+  const n = (s: string | undefined) => parseInt(s || '1', 10);
+  if ((m = lower.match(/(\d+)?\s*days?\s*ago/))) return daysAgo(n(m[1]));
+  if ((m = lower.match(/(\d+)?\s*weeks?\s*ago/))) return daysAgo(n(m[1]) * 7);
+  if ((m = lower.match(/(\d+)?\s*months?\s*ago/))) {
     const d = new Date(today);
-    d.setUTCMonth(d.getUTCMonth() - parseInt(m[1]));
+    d.setUTCMonth(d.getUTCMonth() - n(m[1]));
     return fmt(d);
   }
-  if ((m = lower.match(/(\d+)\s*years?\s*ago/))) {
+  if ((m = lower.match(/(\d+)?\s*years?\s*ago/))) {
     const d = new Date(today);
-    d.setUTCFullYear(d.getUTCFullYear() - parseInt(m[1]));
+    d.setUTCFullYear(d.getUTCFullYear() - n(m[1]));
     return fmt(d);
   }
-  if ((m = lower.match(/(\d+)\s*hours?\s*ago/))) {
+  if ((m = lower.match(/(\d+)?\s*hours?\s*ago/))) {
     return fmt(today);
   }
   if (/\blast\s+week\b/.test(lower)) return daysAgo(7);
@@ -760,6 +1060,21 @@ function buildSessionContext(): string {
   ].join('\n');
 }
 
+/**
+ * Render a 0-1 fraction as a human label ("half", "quarter", ...,
+ * else "<n>%"). Used in chat-bubble explanations for legs sized as
+ * fractions of portfolio/cash.
+ */
+function formatFraction(f: number): string {
+  if (!Number.isFinite(f) || f <= 0) return '0%';
+  if (Math.abs(f - 0.5) < 0.01) return 'half';
+  if (Math.abs(f - 0.25) < 0.01) return 'quarter';
+  if (Math.abs(f - 1 / 3) < 0.01) return 'third';
+  if (Math.abs(f - 0.125) < 0.01) return 'eighth';
+  if (Math.abs(f - 0.1) < 0.01) return 'tenth';
+  return `${Math.round(f * 1000) / 10}%`;
+}
+
 function sessionOf(utcHour: number, utcMin: number): 'pre' | 'open' | 'regular' | 'close' | 'post' | 'closed' {
   const mins = utcHour * 60 + utcMin;
   if (mins < 9 * 60) return 'closed';
@@ -784,13 +1099,210 @@ function buildSystemPrompt(customInstructions: string): string {
 
 ${customInstructions}
 
-You MUST call the parse_trade function. Do not return prose.
+CRITICAL REMINDERS:
+1. You MUST populate the \`legs\` array. There is no global action/ticker/trade_date field — every named ticker is its own leg with its own verb.
+2. Mixed-verb commands ("buy A and short B") require per-leg \`action\` fields. The system CANNOT recover a mixed-verb trade from a single global action.
+3. Per-leg \`trade_date\` and \`time_of_day\` allow commands like "Buy AAPL yesterday at open, short TSLA last week" to produce two different dates.
+4. NEVER invent or "correct" a ticker. If the user wrote SPCX, output SPCX — not SPCE. The system runs Levenshtein correction separately.
+5. NEVER echo price-type keywords (MARKET, LIMIT, STOP, ENTRY, EXIT) as tickers. These are stopwords and the system strips them.
+6. NOTIONAL vs QTY — DO NOT convert between them yourself. If the user spoke in USD ("$1M of NVDA", "$50,000 worth of AAPL", "$25k of TSLA"), set \`qty\` to null and \`notional\` to the dollar amount. If the user spoke in shares ("buy 100 AAPL", "short 50 TSLA"), set \`notional\` to null and \`qty\` to the share count. NEVER set both. NEVER compute share counts from a notional amount — the system owns that math (using the live or historical price) and surfaces the result in the UI; a hard-coded qty you invent will be wrong.
 
-If no portfolio is specified, set portfolio_id to null and the frontend will use the active one. "at market" means MARKET order type. "half" or "percentage" refers to existing position size. "close" or "exit" means sell the entire position. Always extract ticker symbols in uppercase. Provide a brief explanation of what the command does.`;
+If no portfolio is specified, set portfolio_id to null and the frontend will use the active one. "at market" means MARKET order type. "close" or "exit" means sell the entire position. Always extract ticker symbols in uppercase. Provide a brief explanation of what the command does.
+
+PERCENTAGE / FRACTION SIZING (NEW — read carefully):
+When the user expresses the dollar size as a percentage or fraction of their portfolio/cash, set \`notional_basis\` accordingly and leave \`notional\` null. The system resolves the actual dollar amount at execute time using live portfolio state, so you do NOT need to compute a share count.
+
+  - "10% of my portfolio" / "spend 10% of equity on AAPL" / "10% of NAV" / "10% of holdings"
+      -> notional_basis: "PCT_PORTFOLIO", notional_pct: 10
+  - "10% of my cash" / "10% of available cash"
+      -> notional_basis: "PCT_CASH", notional_pct: 10
+  - "half my portfolio" / "a quarter of equity" / "half of my holdings"
+      -> notional_basis: "FRACTION_PORTFOLIO", notional_fraction: 0.5 / 0.25
+  - "half my cash" / "a quarter of my available cash"
+      -> notional_basis: "FRACTION_CASH", notional_fraction: 0.5 / 0.25
+  - "half on X, half on Y" (no percentage, no "of portfolio")
+      -> Each leg gets notional_basis: "FRACTION_PORTFOLIO", notional_fraction: 0.5
+         (system treats this as an EQUAL SPLIT of total portfolio equity — half on X,
+          half on Y, both measured against the same portfolio base). If the user
+         explicitly says "split my cash" / "of available cash", use FRACTION_CASH.
+
+Recognized fractions: half = 0.5, quarter / a quarter = 0.25, third / a third = 0.333, eighth = 0.125, tenth = 0.1. For other fractions, echo the raw number (e.g. "two thirds" -> 0.6667).
+
+The DEFAULT for ambiguous "% of portfolio"-less phrases is portfolio equity. If the user wrote "10% of my portfolio" the answer is unambiguously PCT_PORTFOLIO. If they wrote only "10%" with no base, set notional_basis: "PCT_PORTFOLIO" and add a note in \`explanation\` clarifying which base the system picked (e.g. "(10% of portfolio equity)").`;
 }
 
 function deriveDirectionFromAction(action: 'BUY' | 'SELL' | 'CLOSE' | 'SHORT' | 'COVER'): 'LONG' | 'SHORT' {
   return (action === 'SHORT' || action === 'COVER') ? 'SHORT' : 'LONG';
+}
+
+/**
+ * Infer the action verb that applies to a specific ticker in a
+ * multi-ticker command. The LLM is asked to commit to a per-leg
+ * verb directly in `legs[].action`, but as a safety net we also
+ * scan the original command: for "buy 10 A and short 10 B", we look
+ * backwards from the ticker's first occurrence for the most recent
+ * action verb.
+ *
+ * Returns null if no verb is found — caller should fall back to a
+ * global action or mark `needs_confirmation`.
+ */
+function inferLegAction(
+  command: string,
+  ticker: string,
+): 'BUY' | 'SELL' | 'CLOSE' | 'SHORT' | 'COVER' | null {
+  const upper = command.toUpperCase();
+  const tk = ticker.toUpperCase();
+  // Find the first occurrence of the ticker as a standalone word.
+  const tkRe = new RegExp(`\\b${tk.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+  const m = upper.match(tkRe);
+  if (!m || m.index == null) return null;
+  const beforeTicker = upper.slice(0, m.index);
+  // Scan backwards for the most recent action verb. The verb may be
+  // separated from the ticker by an adverb ("at market", "now"), a
+  // date ("2 days ago"), or a price-type keyword — none of those
+  // are verbs, so we keep looking back. Past-tense forms (BOUGHT,
+  // SOLD) collapse to the present-tense base action.
+  const verbRe = /\b(BUY|BOUGHT|SELL|SOLD|SHORT|SHORTED|COVER|COVERED|CLOSE|CLOSED)\b/g;
+  let last: RegExpExecArray | null = null;
+  let v: RegExpExecArray | null;
+  while ((v = verbRe.exec(beforeTicker)) !== null) last = v;
+  if (!last) return null;
+  const verb = last[1].toUpperCase();
+  // Disambiguate "short" from "short term" / "short term investment"
+  // (those are not action verbs). Match both whitespace and hyphen
+  // separators ("short term" and "short-term").
+  if (verb === 'SHORT' || verb === 'SHORTED') {
+    const afterVerb = beforeTicker.slice(last.index + verb.length);
+    if (/^[-\s]+(TERM|TERM-LONG|TERM-INVESTMENT|TERM-TRADE)\b/i.test(afterVerb)) {
+      return null;
+    }
+  }
+  // Map past tense to present.
+  if (verb === 'BOUGHT') return 'BUY';
+  if (verb === 'SOLD') return 'SELL';
+  if (verb === 'SHORTED') return 'SHORT';
+  if (verb === 'COVERED') return 'COVER';
+  if (verb === 'CLOSED') return 'CLOSE';
+  return verb as 'BUY' | 'SELL' | 'CLOSE' | 'SHORT' | 'COVER';
+}
+
+/**
+ * Infer the per-leg date and time_of_day by looking at the chunk of
+ * the command that precedes this ticker's first occurrence. We
+ * extract a date from "before" the ticker if the user wrote something
+ * like "buy AAPL yesterday, short TSLA last week" — each leg gets
+ * the date closest to (and before) it in the original text.
+ *
+ * Returns null for both fields when the user didn't speak in dates
+ * for that leg.
+ */
+function inferLegDateTime(
+  command: string,
+  ticker: string,
+): { trade_date: string | null; time_of_day: TimeOfDay | null } {
+  const upper = command.toUpperCase();
+  const tk = ticker.toUpperCase();
+  const tkRe = new RegExp(`\\b${tk.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+  const m = upper.match(tkRe);
+  if (!m || m.index == null) return { trade_date: null, time_of_day: null };
+  // Look at the half of the command before the ticker AND the
+  // ticker's own chunk (which may include a date after it on the
+  // same clause). We bias toward the pre-ticker chunk because
+  // English orders "verb ... date ... ticker" most of the time.
+  const before = command.slice(0, m.index);
+  // Detect a date in the surrounding clause. If we find one before
+  // the ticker, that's the per-leg date. If not, fall back to a
+  // global detectDate() on the full command (which catches "3 days
+  // ago" written anywhere in the sentence).
+  const localDate = detectDate(before);
+  const localTod = detectTimeOfDay(before);
+  return {
+    trade_date: localDate,
+    time_of_day: localTod,
+  };
+}
+
+/**
+ * Parse a percentage / fraction sizing phrase. Returns the basis and
+ * the magnitude (pct as 0-100, fraction as 0-1), or null if the user
+ * didn't speak in percentages / fractions of their portfolio or cash.
+ *
+ * Examples:
+ *   "spend 10% of my portfolio on AAPL"  -> { basis: 'PCT_PORTFOLIO', pct: 10 }
+ *   "put 25% of my cash into NVDA"       -> { basis: 'PCT_CASH', pct: 25 }
+ *   "buy a quarter of equity"            -> { basis: 'FRACTION_PORTFOLIO', fraction: 0.25 }
+ *   "half my cash"                       -> { basis: 'FRACTION_CASH', fraction: 0.5 }
+ *   "half on X, half on Y"               -> { basis: 'FRACTION_PORTFOLIO', fraction: 0.5 } (caller handles multi-leg)
+ *   "10% on AAPL" (no base specified)    -> { basis: 'PCT_PORTFOLIO', pct: 10 } (default = portfolio equity)
+ *
+ * The fraction word-list covers the most common English forms; the
+ * LLM path produces more exotic values ("two thirds", "three quarters")
+ * and emits them as raw floats via the schema. This regex path is the
+ * fallback for when the LLM is unavailable.
+ */
+function parseNotionalBasis(command: string): {
+  basis: 'PCT_PORTFOLIO' | 'PCT_CASH' | 'FRACTION_PORTFOLIO' | 'FRACTION_CASH';
+  pct: number | null;
+  fraction: number | null;
+} | null {
+  const lower = command.toLowerCase();
+
+  // ---- Percentages: "10% of my portfolio" / "10% of cash" ----
+  // The number is required; the "of X" base is optional (defaults to
+  // portfolio equity per the system prompt guidance).
+  const pctRe = /(\d+(?:\.\d+)?)\s*(?:%|percent)\s*(?:of\s+(?:my\s+|the\s+|our\s+)?(portfolio|equity|nav|holdings|net\s+worth|account|cash|available\s+cash|buying\s+power))?/i;
+  const pctHit = lower.match(pctRe);
+  if (pctHit) {
+    const pct = parseFloat(pctHit[1]);
+    if (!Number.isFinite(pct) || pct <= 0 || pct > 100) return null;
+    const base = (pctHit[2] || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    if (base === 'cash' || base === 'available cash' || base === 'buying power') {
+      return { basis: 'PCT_CASH', pct, fraction: null };
+    }
+    // Default: portfolio equity. "portfolio" / "equity" / "nav" /
+    // "holdings" / "net worth" / "account" / no base specified.
+    return { basis: 'PCT_PORTFOLIO', pct, fraction: null };
+  }
+
+  // ---- Fractions: "half my portfolio" / "a quarter of equity" ----
+  // Spelled-out fractions come first because the regex is greedy on
+  // numeric patterns. Word list mirrors the prompt's recognition set.
+  const fractionWords: Record<string, number> = {
+    'half': 0.5,
+    'quarter': 0.25,
+    'a quarter': 0.25,
+    'third': 1 / 3,
+    'a third': 1 / 3,
+    'eighth': 0.125,
+    'tenth': 0.1,
+  };
+  // (a) Spelled-out fraction with an explicit base.
+  const fwRe = new RegExp(
+    `\\b(a\\s+)?(${Object.keys(fractionWords).join('|').replace(/\s/g, '\\s+')})\\s+(?:of\\s+(?:my\\s+|the\\s+|our\\s+)?)?(portfolio|equity|nav|holdings|net\\s+worth|cash|available\\s+cash|buying\\s+power)\\b`,
+    'i',
+  );
+  const fwHit = lower.match(fwRe);
+  if (fwHit) {
+    const phrase = (fwHit[2] || '').toLowerCase().trim();
+    const fraction = fractionWords[phrase];
+    if (fraction == null) return null;
+    const base = (fwHit[3] || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    if (base === 'cash' || base === 'available cash' || base === 'buying power') {
+      return { basis: 'FRACTION_CASH', pct: null, fraction };
+    }
+    return { basis: 'FRACTION_PORTFOLIO', pct: null, fraction };
+  }
+  // (b) Bare fraction with no base (e.g. "half on X"). Defaults to
+  // portfolio equity — matches the prompt's default interpretation.
+  // This is also the path that catches "half on X, half on Y".
+  for (const [phrase, value] of Object.entries(fractionWords)) {
+    const re = new RegExp(`\\b(?:a\\s+)?${phrase.replace(/\s/g, '\\s+')}\\b`, 'i');
+    if (re.test(lower)) {
+      return { basis: 'FRACTION_PORTFOLIO', pct: null, fraction: value };
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -891,48 +1403,77 @@ function parseShareCount(command: string): number | string | null {
 /**
  * Regex-based fallback. Used when the LLM is unavailable, returns
  * unparseable JSON, or times out. Conservative: defaults action to
- * BUY, marks needs_confirmation=true if the ticker wasn't detected.
+ * BUY, marks needs_confirmation=true if no ticker was detected.
+ *
+ * The output is in the new legs-canonical shape: at least one leg
+ * in `legs`, and the legacy flat fields mirror the primary (first)
+ * leg for back-compat with the existing frontend.
  */
 function simpleParse(command: string): ParsedCommand {
   const lower = command.toLowerCase();
-  let action: 'BUY' | 'SELL' | 'CLOSE' | 'SHORT' | 'COVER' = 'BUY';
-  if (/\bcover(ing)?\b/.test(lower) || /\bbuy\s+to\s+cover\b/.test(lower)) {
-    action = 'COVER';
-  } else if (/\bclose\b|\bexit\b|\bsell\s+all\b/.test(lower)) {
-    action = 'CLOSE';
-  } else if (/\bshort(\s+sell)?\b|\bshorting\b/.test(lower) && !/\bshort\s+term\b/.test(lower)) {
-    action = 'SHORT';
-  } else if (/\bsell\b/.test(lower)) {
-    action = 'SELL';
-  } else if (/\bbuy\b|\bpurchase\b|\bacquire\b/.test(lower)) {
-    action = 'BUY';
-  }
-  const direction = deriveDirectionFromAction(action);
-  // Only accept high-confidence ticker matches. The HK regex and the
-  // general uppercase token scan both produce false positives on common
-  // share counts (buy 1000 NVDA) and stray letters (Buy 30 minimax ->
-  // ticker "N"). The LLM path corrects these; the fallback must not
-  // pretend to know better. Bail to null and flag needs_confirmation.
-  const resolved = resolveTicker(command);
-  const HIGH_CONFIDENCE: ReadonlyArray<ResolvedTicker['source']> = ['company', 'suffixed', 'fx', 'future'];
-  const ticker =
-    resolved && HIGH_CONFIDENCE.includes(resolved.source) ? resolved.ticker : null;
 
+  // Resolve tickers (regex). We accept only high-confidence matches
+  // (company / suffixed / fx / future) for the fallback path — the
+  // HK regex and the general token scan both produce false positives
+  // on common share counts and stray letters. The LLM path corrects
+  // these; the fallback must not pretend to know better.
+  const HIGH_CONFIDENCE: ReadonlyArray<ResolvedTicker['source']> =
+    ['company', 'suffixed', 'fx', 'future'];
+  const resolved = resolveAllTickers(command);
+  const tickers = resolved
+    .filter((r) => HIGH_CONFIDENCE.includes(r.source))
+    .map((r) => r.ticker);
+
+  // Fallback action (used when no per-ticker verb can be inferred).
+  let fallbackAction: 'BUY' | 'SELL' | 'CLOSE' | 'SHORT' | 'COVER' = 'BUY';
+  if (/\bcover(ing)?\b/.test(lower) || /\bbuy\s+to\s+cover\b/.test(lower)) {
+    fallbackAction = 'COVER';
+  } else if (/\bclose\b|\bexit\b|\bsell\s+all\b/.test(lower)) {
+    fallbackAction = 'CLOSE';
+  } else if (/\bshort(\s+sell)?\b|\bshorting\b/.test(lower) && !/\bshort\s+term\b/.test(lower)) {
+    fallbackAction = 'SHORT';
+  } else if (/\bsell\b/.test(lower)) {
+    fallbackAction = 'SELL';
+  } else if (/\bbuy\b|\bpurchase\b|\bacquire\b/.test(lower)) {
+    fallbackAction = 'BUY';
+  }
+
+  // Single-ticker shortcut for qty/notional/stop: we don't yet know
+  // whether the user spoke for one ticker or many, so we run the
+  // numeric parsers ONCE on the whole command. If multi-ticker, the
+  // qty/notional will be wrong for legs 2..N — the LLM path
+  // produces accurate per-leg numbers and supersedes this.
   let qty: number | string | null = null;
   let notional: number | null = null;
+  // notional_basis / notional_pct / notional_fraction default to
+  // USD/null and are populated only when the user spoke in
+  // percentages or fractions. The system resolves these to a USD
+  // notional at execute time using the live portfolio state.
+  let notionalBasis: NotionalBasis = 'USD';
+  let notionalPct: number | null = null;
+  let notionalFraction: number | null = null;
   const notionalHit = parseNotional(command);
   if (notionalHit != null) {
     notional = notionalHit;
   } else {
-    const shareHit = parseShareCount(command);
-    if (shareHit != null) {
-      qty = shareHit;
-    } else if (lower.includes('half')) {
-      qty = 'HALF';
-    } else if (lower.includes('all') || lower.includes('entire')) {
-      qty = 'ALL';
+    const basisHit = parseNotionalBasis(command);
+    if (basisHit != null) {
+      // Percentage / fraction sizing — leave notional null so the
+      // system knows to resolve at execute time.
+      notionalBasis = basisHit.basis;
+      notionalPct = basisHit.pct;
+      notionalFraction = basisHit.fraction;
     } else {
-      qty = null;
+      const shareHit = parseShareCount(command);
+      if (shareHit != null) {
+        qty = shareHit;
+      } else if (lower.includes('half')) {
+        qty = 'HALF';
+      } else if (lower.includes('all') || lower.includes('entire')) {
+        qty = 'ALL';
+      } else {
+        qty = null;
+      }
     }
   }
 
@@ -943,65 +1484,136 @@ function simpleParse(command: string): ParsedCommand {
   const inMatch = command.match(/in\s+([A-Za-z][A-Za-z\s]*?)(?:,|\s+(?:buy|sell|close|short|cover))/i);
   if (inMatch) portfolioName = inMatch[1].trim();
 
-  const actionLabel: Record<typeof action, string> = {
-    BUY: 'Buy',
-    SELL: 'Sell',
-    CLOSE: 'Close',
-    SHORT: 'Short',
-    COVER: 'Cover',
+  const priceType: PriceType = lower.includes('limit') ? 'LIMIT' : 'MARKET';
+
+  // Build legs. The fallback can only identify tickers via regex, so
+  // for the LLM-supplied `legs` path this function is a coarse sketch;
+  // the parseCommand caller merges / overrides with the LLM output.
+  const legs: ParsedLeg[] = tickers.length > 0
+    ? tickers.map((tk) => {
+        const inferred = inferLegAction(command, tk) ?? fallbackAction;
+        const dt = inferLegDateTime(command, tk);
+        return {
+          action: inferred,
+          direction: deriveDirectionFromAction(inferred),
+          ticker: tk,
+          // qty / notional are command-global here; refine for
+          // multi-ticker commands in the leg builder.
+          qty: tickers.length === 1 ? qty : null,
+          notional: tickers.length === 1 ? notional : null,
+          // For multi-ticker percentage / fraction commands ("half
+          // on X, half on Y"), every leg gets the same basis so the
+          // system resolves them as an equal split.
+          notional_basis: tickers.length === 1 ? notionalBasis : (notionalBasis !== 'USD' ? notionalBasis : 'USD'),
+          notional_pct: tickers.length === 1 ? notionalPct : (notionalBasis !== 'USD' ? notionalPct : null),
+          notional_fraction: tickers.length === 1 ? notionalFraction : (notionalBasis !== 'USD' ? notionalFraction : null),
+          price_type: priceType,
+          limit_price: null,
+          stop_loss_pct: stopLossPct,
+          trade_date: dt.trade_date,
+          time_of_day: dt.time_of_day,
+          market_price: null,
+          resolved_price: null,
+          preview_qty: null,
+          price_unavailable_reason: null,
+          ticker_suggestion: null,
+          company_name: null,
+          sector: null,
+          from_cache: null,
+        };
+      })
+    : [{
+        // No ticker detected — synthesize a placeholder leg so the
+        // shape stays consistent. needs_confirmation will flag it.
+        action: fallbackAction,
+        direction: deriveDirectionFromAction(fallbackAction),
+        ticker: '',
+        qty,
+        notional,
+        notional_basis: notionalBasis,
+        notional_pct: notionalPct,
+        notional_fraction: notionalFraction,
+        price_type: priceType,
+        limit_price: null,
+        stop_loss_pct: stopLossPct,
+        trade_date: null,
+        time_of_day: null,
+        market_price: null,
+        resolved_price: null,
+        preview_qty: null,
+        price_unavailable_reason: null,
+        ticker_suggestion: null,
+        company_name: null,
+        sector: null,
+        from_cache: null,
+      }];
+
+  const primary = legs[0];
+  const actionLabel: Record<LegAction, string> = {
+    BUY: 'Buy', SELL: 'Sell', CLOSE: 'Close', SHORT: 'Short', COVER: 'Cover',
   };
-  const explanationParts: string[] = [actionLabel[action]];
-  if (notional != null) explanationParts.push(`$${notional.toLocaleString()}`);
-  if (qty != null) explanationParts.push(`${qty}`);
-  explanationParts.push(ticker || '???');
-  explanationParts.push(`at ${lower.includes('limit') ? 'limit' : 'market'} price`);
+  const explanationParts: string[] = [actionLabel[primary.action]];
+  if (primary.notional != null) explanationParts.push(`$${primary.notional.toLocaleString()}`);
+  if (primary.qty != null) explanationParts.push(`${primary.qty}`);
+  explanationParts.push(primary.ticker || '???');
+  explanationParts.push(`at ${priceType === 'LIMIT' ? 'limit' : 'market'} price`);
   if (stopLossPct) explanationParts.push(`with ${stopLossPct}% stop loss`);
 
   return {
     portfolio_id: null,
     portfolio_name: portfolioName,
-    action,
-    direction,
-    ticker,
-    qty,
-    notional,
-    price_type: lower.includes('limit') ? 'LIMIT' : 'MARKET',
-    limit_price: null,
-    stop_loss_pct: stopLossPct,
+    legs,
+    is_historical: legs.some((l) =>
+      l.trade_date != null && l.trade_date < new Date().toISOString().slice(0, 10)),
     confidence: 0.7,
-    needs_confirmation: !ticker || (notional == null && qty == null),
+    needs_confirmation: !primary.ticker || (primary.notional == null && primary.qty == null),
     explanation: explanationParts.join(' '),
     original_command: command,
-    trade_date: null,
-    time_of_day: detectTimeOfDay(command),
-    is_historical: false,
     preview_qty: null,
+    market_context: '',
+    // Legacy back-compat fields (mirror primary leg):
+    action: primary.action,
+    direction: primary.direction,
+    ticker: primary.ticker || null,
+    qty: primary.qty,
+    price_type: primary.price_type,
+    limit_price: primary.limit_price,
+    stop_loss_pct: primary.stop_loss_pct,
+    trade_date: primary.trade_date,
+    time_of_day: primary.time_of_day,
+    notional: primary.notional,
+    ticker_suggestion: null,
+    price_unavailable_reason: null,
   };
 }
 
 /**
+ * Sanitize a ticker value returned by the LLM. The LLM doesn't
+ * apply the same stopword list as `resolveTicker`, so it sometimes
+ * hallucinates tickers from price-type keywords ("MARKET",
+ * "LIMIT", "STOP"), action verbs ("BUY", "SELL"), currency codes,
+ * etc. We strip those here and return null instead. The
+ * `resolveTicker` regex path is unaffected — this is purely a
+ * guardrail on the LLM output.
+ */
+function sanitizeTicker(raw: any): string | null {
+  if (typeof raw !== 'string') return null;
+  const upper = raw.toUpperCase().trim();
+  if (!upper) return null;
+  if (STOPWORDS.has(upper)) return null;
+  // Extra defensive: price-type keywords. These are already in
+  // STOPWORDS, but listing them again here documents the intent.
+  if (['MARKET', 'LIMIT', 'STOP', 'LOSS', 'ENTRY', 'EXIT'].includes(upper)) return null;
+  return upper;
+}
+
+/**
  * Safety net: accept whatever the LLM returned, coerce types, fill
- * missing fields with safe defaults.
+ * missing fields with safe defaults. Output is the new legs-canonical
+ * shape: `legs` is always present and has >= 1 element, and the
+ * legacy flat fields mirror the first leg.
  */
 function validateAndNormalize(raw: any, command: string): ParsedCommand {
-  // Action whitelist expanded to include SHORT and COVER. Unknown
-  // values fall back to BUY (matches the old behaviour).
-  const validActions: Array<'BUY' | 'SELL' | 'CLOSE' | 'SHORT' | 'COVER'> =
-    ['BUY', 'SELL', 'CLOSE', 'SHORT', 'COVER'];
-  const action: 'BUY' | 'SELL' | 'CLOSE' | 'SHORT' | 'COVER' =
-    validActions.includes(raw?.action) ? raw.action : 'BUY';
-  const direction = deriveDirectionFromAction(action);
-
-  const priceType: 'MARKET' | 'LIMIT' | 'STOP' =
-    ['MARKET', 'LIMIT', 'STOP'].includes(raw?.price_type) ? raw.price_type : 'MARKET';
-
-  let qty: number | string | null = raw?.qty ?? null;
-  if (typeof qty === 'number' && !Number.isFinite(qty)) qty = null;
-  if (typeof qty === 'string' && !['ALL', 'HALF'].includes(qty)) {
-    const n = Number(qty);
-    qty = Number.isFinite(n) ? n : null;
-  }
-
   const numOrNull = (v: any): number | null => {
     if (typeof v === 'number' && Number.isFinite(v)) return v;
     if (typeof v === 'string') {
@@ -1010,48 +1622,204 @@ function validateAndNormalize(raw: any, command: string): ParsedCommand {
     }
     return null;
   };
-  const limitPrice = numOrNull(raw?.limit_price);
-  const stopLossPct = numOrNull(raw?.stop_loss_pct);
+  const validActions: LegAction[] = ['BUY', 'SELL', 'CLOSE', 'SHORT', 'COVER'];
+  const validSessions: TimeOfDay[] = ['pre', 'open', 'regular', 'close', 'post', 'eod'];
+
+  const coerceAction = (v: any, fallback: LegAction): LegAction =>
+    typeof v === 'string' && (validActions as string[]).includes(v)
+      ? (v as LegAction) : fallback;
+  const coercePriceType = (v: any, fallback: PriceType): PriceType =>
+    v === 'LIMIT' || v === 'STOP' ? v : fallback === 'LIMIT' || fallback === 'STOP' ? fallback : 'MARKET';
+  const coerceTimeOfDay = (v: any): TimeOfDay | null =>
+    typeof v === 'string' && (validSessions as string[]).includes(v)
+      ? (v as TimeOfDay) : null;
+  const coerceTradeDate = (v: any): string | null =>
+    typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null;
+  const coerceQty = (v: any): number | string | null => {
+    if (v == null) return null;
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+    if (typeof v === 'string') {
+      if (v === 'ALL' || v === 'HALF') return v;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  };
+  const coerceNotional = (v: any): number | null => {
+    const n = numOrNull(v);
+    return n != null && n > 0 ? n : null;
+  };
+
+  // Coerce a single leg from whatever the LLM produced. The LLM is
+  // expected to commit to a per-leg action/date (the new schema has
+  // no global slot for these), but we apply safety nets:
+  //   - ticker: sanitize (strip stopwords) and null if empty
+  //   - action: drop ticker-fallback if sanitize wiped it
+  const coerceLeg = (l: any): ParsedLeg | null => {
+    const ticker = sanitizeTicker(l?.ticker);
+    if (!ticker) return null;
+    const action = coerceAction(l?.action, 'BUY');
+    // notional_basis: default USD; whitelist the known values.
+    const basisRaw = (l?.notional_basis ?? 'USD').toString();
+    const validBases: NotionalBasis[] = ['USD', 'PCT_PORTFOLIO', 'PCT_CASH', 'FRACTION_PORTFOLIO', 'FRACTION_CASH'];
+    const notionalBasis: NotionalBasis = (validBases as string[]).includes(basisRaw)
+      ? (basisRaw as NotionalBasis)
+      : 'USD';
+    // pct / fraction: only meaningful when the basis says so. Coerce
+    // to sensible ranges; out-of-range values fall back to null.
+    const pctRaw = numOrNull(l?.notional_pct);
+    const fractionRaw = numOrNull(l?.notional_fraction);
+    const notionalPct =
+      notionalBasis === 'PCT_PORTFOLIO' || notionalBasis === 'PCT_CASH'
+        ? (pctRaw != null && pctRaw > 0 && pctRaw <= 100 ? pctRaw : null)
+        : null;
+    const notionalFraction =
+      notionalBasis === 'FRACTION_PORTFOLIO' || notionalBasis === 'FRACTION_CASH'
+        ? (fractionRaw != null && fractionRaw > 0 && fractionRaw <= 1 ? fractionRaw : null)
+        : null;
+    // Invariant: when the basis is non-USD, `notional` must be null
+    // (the system resolves at execute time). The LLM sometimes echoes
+    // a notional anyway — drop it here so the frontend's
+    // resolveLegBasis() is unambiguous.
+    const notional =
+      notionalBasis === 'USD' ? coerceNotional(l?.notional) : null;
+    return {
+      action,
+      direction: deriveDirectionFromAction(action),
+      ticker,
+      qty: coerceQty(l?.qty),
+      notional,
+      notional_basis: notionalBasis,
+      notional_pct: notionalPct,
+      notional_fraction: notionalFraction,
+      price_type: coercePriceType(l?.price_type, 'MARKET'),
+      limit_price: numOrNull(l?.limit_price),
+      stop_loss_pct: numOrNull(l?.stop_loss_pct),
+      trade_date: coerceTradeDate(l?.trade_date),
+      time_of_day: coerceTimeOfDay(l?.time_of_day),
+      market_price: null,
+      resolved_price: null,
+      preview_qty: null,
+      price_unavailable_reason: null,
+      ticker_suggestion: null,
+      company_name: null,
+      sector: null,
+      from_cache: null,
+    };
+  };
+
+  // Build the leg list from three sources, in priority order:
+  //   1. LLM-supplied `raw.legs` (after coercion + filtering).
+  //   2. LLM-supplied `raw.ticker` (legacy single-ticker back-compat
+  //      for older function versions that still emit a flat ticker).
+  //   3. Regex `resolveAllTickers(command)` (the fallback path).
+  // The parse handler later overlays per-leg market data and merges
+  // anything the regex path adds that the LLM missed.
+  let legs: ParsedLeg[] = [];
+  if (Array.isArray(raw?.legs)) {
+    for (const l of raw.legs) {
+      const coerced = coerceLeg(l);
+      if (coerced) legs.push(coerced);
+    }
+  }
+  // If the LLM didn't produce legs but did produce a flat ticker
+  // (older schema), promote it to a single leg.
+  if (legs.length === 0) {
+    const flat = coerceLeg({ ticker: raw?.ticker, action: raw?.action });
+    if (flat) legs.push(flat);
+  }
+  // Last-resort: regex-detected tickers. We attach the LLM's global
+  // action/date to each so a single-ticker command still parses
+  // cleanly. The leg builder later overlays per-leg inference.
+  if (legs.length === 0) {
+    const regexResolved = resolveAllTickers(command);
+    for (const r of regexResolved) {
+      const coerced = coerceLeg({ ticker: r.ticker, action: raw?.action });
+      if (coerced) legs.push(coerced);
+    }
+  }
+  // If we STILL have no legs (e.g. the LLM returned nothing and the
+  // regex found nothing), synthesize a placeholder so the shape
+  // stays consistent. needs_confirmation will flag the missing
+  // ticker.
+  if (legs.length === 0) {
+    legs.push({
+      action: coerceAction(raw?.action, 'BUY'),
+      direction: 'LONG',
+      ticker: '',
+      qty: coerceQty(raw?.qty),
+      notional: coerceNotional(raw?.notional),
+      notional_basis: 'USD',
+      notional_pct: null,
+      notional_fraction: null,
+      price_type: coercePriceType(raw?.price_type, 'MARKET'),
+      limit_price: numOrNull(raw?.limit_price),
+      stop_loss_pct: numOrNull(raw?.stop_loss_pct),
+      trade_date: coerceTradeDate(raw?.trade_date),
+      time_of_day: coerceTimeOfDay(raw?.time_of_day),
+      market_price: null,
+      resolved_price: null,
+      preview_qty: null,
+      price_unavailable_reason: null,
+      ticker_suggestion: null,
+      company_name: null,
+      sector: null,
+      from_cache: null,
+    });
+  }
 
   let confidence = numOrNull(raw?.confidence);
   if (confidence == null) confidence = 0.7;
   confidence = Math.max(0, Math.min(1, confidence));
 
   const todayIso = new Date().toISOString().slice(0, 10);
-  const tradeDate =
-    typeof raw?.trade_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.trade_date)
-      ? raw.trade_date
-      : null;
-  const isHistorical = tradeDate != null && tradeDate < todayIso;
+  const isHistorical = legs.some(
+    (l) => l.trade_date != null && l.trade_date < todayIso,
+  );
 
-  const notional = numOrNull(raw?.notional);
+  // Ticker guard: if the LLM produced a leg whose ticker was a
+  // stopword, it was dropped above. Flag needs_confirmation so the
+  // user is prompted.
+  const primary = legs[0];
+  const anyTickerWasStopword = Array.isArray(raw?.legs)
+    ? raw.legs.some(
+        (l: any) => typeof l?.ticker === 'string' && sanitizeTicker(l.ticker) === null,
+      )
+    : (typeof raw?.ticker === 'string' && sanitizeTicker(raw.ticker) === null);
 
-  const timeOfDayRaw = raw?.time_of_day;
-  const validSessions = ['pre', 'open', 'regular', 'close', 'post', 'eod'];
-  const timeOfDay: 'pre' | 'open' | 'regular' | 'close' | 'post' | 'eod' | null =
-    typeof timeOfDayRaw === 'string' && validSessions.includes(timeOfDayRaw)
-      ? (timeOfDayRaw as 'pre' | 'open' | 'regular' | 'close' | 'post' | 'eod')
-      : null;
+  const explanation = (() => {
+    const base = typeof raw?.explanation === 'string' ? raw.explanation : '';
+    if (anyTickerWasStopword) {
+      return (base ? base + ' ' : '') +
+        `(a ticker was not recognized as a stock symbol — please specify one)`;
+    }
+    return base;
+  })();
 
   return {
     portfolio_id: typeof raw?.portfolio_id === 'string' ? raw.portfolio_id : null,
     portfolio_name: typeof raw?.portfolio_name === 'string' ? raw.portfolio_name : null,
-    action,
-    direction,
-    ticker: typeof raw?.ticker === 'string' ? raw.ticker.toUpperCase() : null,
-    qty,
-    notional: notional != null && notional > 0 ? notional : null,
-    price_type: priceType,
-    limit_price: limitPrice,
-    stop_loss_pct: stopLossPct,
-    confidence,
-    needs_confirmation: Boolean(raw?.needs_confirmation),
-    explanation: typeof raw?.explanation === 'string' ? raw.explanation : '',
-    original_command: command,
-    trade_date: tradeDate,
-    time_of_day: timeOfDay,
+    legs,
     is_historical: isHistorical,
+    confidence,
+    needs_confirmation: Boolean(raw?.needs_confirmation) || anyTickerWasStopword,
+    explanation,
+    original_command: command,
     preview_qty: null,
+    market_context: '',
+    // Legacy back-compat fields (mirror primary leg):
+    action: primary.action,
+    direction: primary.direction,
+    ticker: primary.ticker || null,
+    qty: primary.qty,
+    price_type: primary.price_type,
+    limit_price: primary.limit_price,
+    stop_loss_pct: primary.stop_loss_pct,
+    trade_date: primary.trade_date,
+    time_of_day: primary.time_of_day,
+    notional: primary.notional,
+    ticker_suggestion: null,
+    price_unavailable_reason: null,
   };
 }
 
@@ -1085,15 +1853,20 @@ async function parseCommand(
 
   let parsed = validateAndNormalize(liteResult, command);
 
-  if (parsed.confidence < 0.8 && parsed.ticker) {
+  // Self-critique: for the primary ticker, ask the larger model
+  // "did the user mean this?" Only fires for single-ticker commands
+  // (multi-leg mixed-verb commands are unambiguous per-leg and the
+  // critique prompt doesn't generalize cleanly).
+  const primaryTicker = parsed.legs[0]?.ticker;
+  if (parsed.confidence < 0.8 && primaryTicker) {
     const critSystem = `You are a trade-command disambiguator. Answer with a single JSON object: {"answer": "yes" or "no", "reason": "..."}.`;
-    const critPrompt = `Did the user mean ticker ${parsed.ticker} for command: "${command}"? Consider context: action verb, asset class, position size. Answer concisely.`;
+    const critPrompt = `Did the user mean ticker ${primaryTicker} for command: "${command}"? Consider context: action verb, asset class, position size. Answer concisely.`;
     const crit = await callLLM(critSystem, critPrompt, GEMINI_FALLBACK_URL, LLM_CRITIQUE_TIMEOUT_MS);
     if (crit && typeof crit.answer === 'string') {
       if (crit.answer.toLowerCase() === 'no') {
         parsed.needs_confirmation = true;
         parsed.explanation = (parsed.explanation || '') +
-          ` (self-critique: ticker ${parsed.ticker} may be wrong — ${crit.reason || 'low confidence'})`;
+          ` (self-critique: ticker ${primaryTicker} may be wrong — ${crit.reason || 'low confidence'})`;
       } else {
         parsed.confidence = Math.min(1, parsed.confidence + 0.1);
       }
@@ -1107,22 +1880,26 @@ async function parseCommand(
 // 7. HTTP entry
 // =====================================================================
 
-function jsonResponse(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
+// CORS handling is in _shared/cors.ts. Functions deployed with
+// `--no-verify-jwt` have the gateway forward OPTIONS into the body
+// and strip the gateway's own CORS headers, so we set them here on
+// every response (preflight + actual).
 
 serve(async (req: Request) => {
-  // Optional Origin allowlist (ALLOWED_ORIGINS env var). The Supabase
-  // gateway handles the actual CORS preflight + headers; this is a
-  // single explicit config point if you want to lock things down at
-  // the function layer too. Skip for OPTIONS — the gateway owns preflight.
-  if (req.method !== 'OPTIONS') {
-    const originErr = checkOrigin(req);
-    if (originErr) return originErr;
+  // Short-circuit CORS preflight. The Supabase gateway would normally
+  // do this, but with --no-verify-jwt it forwards OPTIONS into the
+  // function body — and the body has no Authorization header on a
+  // preflight, so the auth check below would 401 and the browser
+  // would block the request (no Access-Control-Allow-Origin).
+  if (req.method === 'OPTIONS') {
+    return handleOptions(req);
   }
+
+  // Optional Origin allowlist (ALLOWED_ORIGINS env var). Single explicit
+  // config point if you want to lock things down at the function layer
+  // too.
+  const originErr = checkOrigin(req);
+  if (originErr) return originErr;
 
   try {
     const user = await getUserFromRequest(req);
@@ -1171,10 +1948,65 @@ serve(async (req: Request) => {
             ? formatMarketContext(live.quote, resolved.ticker)
             : '';
         }
+        // Defensive: re-apply sanitization to the cached result.
+        // The cache may contain entries written by an older
+        // function version that didn't strip stopword tickers from
+        // the LLM's output. Re-sanitizing here ensures the cache
+        // doesn't outlive the validation rules.
+        const cachedLegs = Array.isArray(cached.legs) ? cached.legs : [];
+        const sanitizedLegs: ParsedLeg[] = cachedLegs
+          .map((l: any) => {
+            const tk = sanitizeTicker(l?.ticker);
+            if (!tk) return null;
+            return {
+              action: l?.action ?? 'BUY',
+              direction: l?.direction ?? 'LONG',
+              ticker: tk,
+              qty: l?.qty ?? null,
+              notional: l?.notional ?? null,
+              // notional_basis was added later than most other fields;
+              // default to USD when reading older cache entries.
+              notional_basis: (l?.notional_basis ?? 'USD') as NotionalBasis,
+              notional_pct: l?.notional_pct ?? null,
+              notional_fraction: l?.notional_fraction ?? null,
+              price_type: l?.price_type ?? 'MARKET',
+              limit_price: l?.limit_price ?? null,
+              stop_loss_pct: l?.stop_loss_pct ?? null,
+              trade_date: l?.trade_date ?? null,
+              time_of_day: l?.time_of_day ?? null,
+              market_price: l?.market_price ?? null,
+              resolved_price: l?.resolved_price ?? null,
+              price_unavailable_reason: l?.price_unavailable_reason ?? null,
+              ticker_suggestion: l?.ticker_suggestion ?? null,
+              company_name: l?.company_name ?? null,
+              sector: l?.sector ?? null,
+              from_cache: l?.from_cache ?? null,
+            } as ParsedLeg;
+          })
+          .filter((l: any): l is ParsedLeg => l !== null);
+        const primaryLeg = sanitizedLegs[0];
         return jsonResponse({
           success: true,
           data: {
             ...cached,
+            legs: sanitizedLegs,
+            // Back-compat flat fields mirror the primary leg.
+            ticker: primaryLeg?.ticker ?? null,
+            action: primaryLeg?.action ?? cached.action,
+            direction: primaryLeg?.direction ?? cached.direction,
+            qty: primaryLeg?.qty ?? null,
+            price_type: primaryLeg?.price_type ?? 'MARKET',
+            limit_price: primaryLeg?.limit_price ?? null,
+            stop_loss_pct: primaryLeg?.stop_loss_pct ?? null,
+            trade_date: primaryLeg?.trade_date ?? null,
+            time_of_day: primaryLeg?.time_of_day ?? null,
+            notional: primaryLeg?.notional ?? null,
+            // If the LLM's primary ticker was a stopword, the cache
+            // entry was written before we had a chance to set
+            // needs_confirmation. Force it on so the user is prompted.
+            needs_confirmation:
+              Boolean(cached.needs_confirmation) ||
+              (sanitizedLegs.length === 0),
             market_price: displayPrice,
             market_context: marketContext,
             from_cache: true,
@@ -1193,54 +2025,22 @@ serve(async (req: Request) => {
       const portfolioList =
         (portfolios || []).map((p: any) => `${p.name} (${p.id})`).join(', ') || 'None';
 
-      const resolved = resolveTicker(command);
       const detectedDate = detectDate(command);
       const detectedTimeOfDay = detectTimeOfDay(command);
       const todayIso = new Date().toISOString().slice(0, 10);
       const detectedIsHistorical =
         detectedDate != null && detectedDate < todayIso;
 
-      let marketQuote: MarketQuote | null = null;
-      let historicalPrice: number | null = null;
-      let historicalDate: string | null = null;
-      let priceUnavailableReason: string | null = null;
-
-      if (resolved && detectedIsHistorical) {
-        const hist = await fetchHistoricalPrice(resolved.ticker, detectedDate!, userAuth);
-        if (hist) {
-          historicalPrice = hist.close_price;
-          historicalDate = hist.date;
-          marketQuote = {
-            ticker: resolved.ticker,
-            current_price: hist.close_price,
-            previous_close: null,
-            change_pct: null,
-            day_high: null,
-            day_low: null,
-            company_name: resolved.matchedTerm,
-            sector: null,
-            last_updated: new Date().toISOString(),
-            from_cache: false,
-          };
-        } else {
-          console.warn(`Historical fetch failed for ${resolved.ticker}@${detectedDate}, trying live fallback`);
-          const live = await ensureFreshQuote(resolved.ticker, userAuth);
-          marketQuote = live.quote;
-          if (!live.quote) priceUnavailableReason = `historical: ${live.unavailable_reason}`;
-        }
-      } else if (resolved) {
-        const live = await ensureFreshQuote(resolved.ticker, userAuth);
-        marketQuote = live.quote;
-        priceUnavailableReason = live.unavailable_reason;
-      } else {
-        priceUnavailableReason = 'no ticker detected in command';
-      }
-
-      const marketContext = marketQuote
-        ? (historicalPrice
-            ? `Market data for ${resolved!.ticker} as of ${historicalDate}: close=$${historicalPrice.toFixed(2)}, source=bloomberg historical.`
-            : formatMarketContext(marketQuote, resolved!.ticker))
-        : `Market data for the requested ticker: unavailable${priceUnavailableReason ? ` (${priceUnavailableReason})` : ''}. The user may need to specify a limit price or check the bloomberg relay (see SETUP.md).`;
+      // Detect tickers up front so the LLM prompt can include a
+      // (text-only) market-data hint. We do NOT pre-fetch quotes
+      // here — the post-LLM legResults below is the authoritative
+      // source and reuses the same fetch helpers. Pre-fetching
+      // doubled the per-request latency and risked timing out the
+      // gateway's 60s budget on slow Bloomberg relays.
+      const preResolved = resolveAllTickers(command);
+      const tickerHint = preResolved.length === 0
+        ? 'No ticker detected in command. If the user wrote a company name, map it; if a symbol, uppercase it. If unclear, produce an empty legs array and set needs_confirmation=true. NEVER invent a similar-looking real ticker (e.g. do not output SPCE when the user wrote SPCX).'
+        : `Tickers detected by regex (will fetch real prices after LLM): ${preResolved.map((r) => r.ticker).join(', ')}. The system handles ticker typo correction via Levenshtein; you should echo the ticker as written. If the regex detected a ticker the user did NOT actually write, omit it.`;
 
       const sessionContext = buildSessionContext();
       const customInstructions = await loadSystemInstructions();
@@ -1253,39 +2053,339 @@ serve(async (req: Request) => {
 
       const parsed = await parseCommand(
         command,
-        marketContext,
+        tickerHint,
         sessionContext,
         systemPromptWithPortfolios,
       );
 
-      const finalTicker = parsed.ticker ?? resolved?.ticker ?? null;
-      const finalTradeDate = parsed.trade_date ?? detectedDate ?? null;
-      const finalIsHistorical =
-        finalTradeDate != null && finalTradeDate < todayIso;
-      const finalTimeOfDay = parsed.time_of_day ?? detectedTimeOfDay ?? null;
+      // =================================================================
+      // Leg builder.
+      //
+      // The new shape is legs-canonical. The LLM emits one entry per
+      // ticker with its own action, qty/notional, price_type, date, and
+      // time_of_day. We:
+      //   1. Take the LLM's legs (in order) as the primary source.
+      //   2. Append any tickers the regex detected that the LLM
+      //      missed (rare; the LLM usually wins).
+      //   3. For each leg, derive the per-leg action/date/time_of_day
+      //      using the LLM's value first, then the local inferLeg*
+      //      scan, then the global detectDate/detectTimeOfDay
+      //      fallback. This makes "Buy AAPL yesterday, short TSLA
+      //      last week" work even if the LLM only echoed the global
+      //      date.
+      //   4. Cross-check the LLM-supplied ticker against the regex
+      //      resolution: if the user wrote SPCX and the LLM returned
+      //      SPCE, the regex is authoritative (the LLM is
+      //      hallucinating). Replace the ticker and flag the leg.
+      //   5. Fetch market data for every leg in parallel (live or
+      //      historical based on the per-leg date).
+      // =================================================================
+      const regexResolved = resolveAllTickers(command);
+      const regexByTicker = new Map<string, ResolvedTicker>();
+      for (const r of regexResolved) regexByTicker.set(r.ticker, r);
+
+      // LLM-supplied tickers in declared order. Use them to detect
+      // a "ticker swap" (LLM invented a different ticker than the
+      // user wrote).
+      const llmTickers: string[] = (parsed.legs || [])
+        .map((l) => (l.ticker || '').toUpperCase())
+        .filter(Boolean);
+      const regexTickerSet = new Set(regexByTicker.keys());
+
+      // If the LLM's legs overlap with the regex set, trust the
+      // regex's ordering (it matches the order in the command). If
+      // the LLM's legs are completely disjoint (the LLM invented
+      // tickers), keep the LLM's order but flag for confirmation.
+      const tickerOrder: string[] = [];
+      const seenT = new Set<string>();
+      // Pass 1: regex tickers (in command order), but ONLY if the
+      // LLM agreed on at least one of them (avoids masking the
+      // LLM-only case where it correctly mapped a company name).
+      const llmAndRegexOverlap = llmTickers.some((t) => regexTickerSet.has(t));
+      if (llmAndRegexOverlap) {
+        for (const r of regexResolved) {
+          if (!seenT.has(r.ticker)) { tickerOrder.push(r.ticker); seenT.add(r.ticker); }
+        }
+      }
+      // Pass 2: LLM legs in declared order, skipping anything
+      // already in tickerOrder and flagging tickers the regex DID
+      // NOT detect as potential hallucinations.
+      const llmHallucinations = new Set<string>();
+      for (const l of parsed.legs || []) {
+        const t = (l.ticker || '').toUpperCase();
+        if (!t || seenT.has(t)) continue;
+        // LLM-only ticker. Allow it (e.g. company name -> LLM mapped
+        // to a real ticker), but record a flag so the leg builder
+        // can warn the user.
+        if (regexTickerSet.size > 0 && !regexByTicker.has(t)) {
+          llmHallucinations.add(t);
+        }
+        tickerOrder.push(t);
+        seenT.add(t);
+      }
+      // Pass 3: any remaining regex tickers the LLM didn't mention.
+      for (const r of regexResolved) {
+        if (!seenT.has(r.ticker)) { tickerOrder.push(r.ticker); seenT.add(r.ticker); }
+      }
+
+      // Build the input legs.
+      const legInputs: ParsedLeg[] = tickerOrder.map((t) => {
+        const llmLeg = (parsed.legs || []).find(
+          (l) => (l.ticker || '').toUpperCase() === t,
+        );
+        // Per-leg action resolution:
+        //   1. LLM-supplied leg.action (the canonical source).
+        //   2. Server inference (inferLegAction).
+        //   3. LLM's primary leg's action (last-resort fallback).
+        const llmAction = llmLeg?.action ?? null;
+        const inferred = inferLegAction(command, t);
+        const action = (llmAction ?? inferred ?? parsed.legs[0]?.action ?? 'BUY') as LegAction;
+        // Per-leg date resolution:
+        //   1. LLM-supplied leg.trade_date.
+        //   2. Server inference (inferLegDateTime -> per-ticker chunk).
+        //   3. Global detectedDate (applies to whole command).
+        // The first two allow "Buy AAPL yesterday, short TSLA last
+        // week" to produce two different dates. The third is the
+        // catch-all for "buy 100 AAPL and 50 MSFT 3 days ago".
+        const inferredDate = inferLegDateTime(command, t);
+        const tradeDate = llmLeg?.trade_date ?? inferredDate.trade_date ?? detectedDate;
+        // Per-leg time_of_day: same priority order.
+        const llmTod = llmLeg?.time_of_day ?? null;
+        const inferredTod = inferredDate.time_of_day;
+        const tod = llmTod ?? inferredTod ?? detectedTimeOfDay;
+        return {
+          action,
+          direction: deriveDirectionFromAction(action),
+          ticker: t,
+          qty: llmLeg?.qty ?? (tickerOrder.length === 1 ? parsed.qty : null),
+          notional: llmLeg?.notional ?? (tickerOrder.length === 1 ? parsed.notional : null),
+          // Per-leg sizing basis. Priority: LLM's per-leg basis -> LLM's
+          // primary leg's basis -> USD. For multi-leg percentage/fraction
+          // commands ("half on X, half on Y"), each ticker is its own leg
+          // but the LLM is expected to emit the same basis/fraction on
+          // each (it's the system's job to sum them at execute time and
+          // check <= 100%).
+          notional_basis: llmLeg?.notional_basis ?? parsed.legs[0]?.notional_basis ?? 'USD',
+          notional_pct: llmLeg?.notional_pct ?? parsed.legs[0]?.notional_pct ?? null,
+          notional_fraction: llmLeg?.notional_fraction ?? parsed.legs[0]?.notional_fraction ?? null,
+          price_type: llmLeg?.price_type ?? parsed.price_type,
+          limit_price: llmLeg?.limit_price ?? null,
+          stop_loss_pct: llmLeg?.stop_loss_pct ?? parsed.stop_loss_pct,
+          trade_date: tradeDate,
+          time_of_day: tod,
+          market_price: null,
+          resolved_price: null,
+          preview_qty: null,
+          price_unavailable_reason: null,
+          ticker_suggestion: null,
+          company_name: null,
+          sector: null,
+          from_cache: null,
+        };
+      });
+
+      // If the LLM's ticker differs from the regex (and the user
+      // appears to have used the regex form), prefer the regex
+      // ticker. The LLM might have picked a different but similar
+      // real ticker (the SPCX->SPCE class of bug) — replacing it
+      // with the regex's value brings the LLM's reasoning back in
+      // line with what the user actually typed.
+      for (const leg of legInputs) {
+        if (llmHallucinations.has(leg.ticker)) {
+          // The LLM introduced a ticker the regex didn't see. We
+          // can't be sure — could be a legit company-name mapping —
+          // so we keep the ticker but flag the leg.
+          leg.price_unavailable_reason =
+            `ticker "${leg.ticker}" was inferred by the AI but not detected in the original text; please confirm`;
+          leg.ticker_suggestion = null;
+        }
+      }
+
+      // Fetch market data per leg (parallel). Each leg uses its
+      // own trade_date for historical lookups; missing historical
+      // data falls back to live.
+      const legResults: Array<ParsedLeg & {
+        market_change_pct: number | null;
+        market_context: string;
+      }> = await Promise.all(legInputs.map(async (leg) => {
+        if (!leg.ticker || STOPWORDS.has(leg.ticker)) {
+          return {
+            ...leg,
+            market_change_pct: null,
+            market_context: 'Ticker is a stopword / price-type keyword; not a stock symbol.',
+            price_unavailable_reason: leg.price_unavailable_reason
+              ?? 'ticker is a stopword, not a stock symbol',
+          };
+        }
+        const isHistoricalLeg =
+          leg.trade_date != null && leg.trade_date < todayIso;
+        let quote: MarketQuote | null = null;
+        let histPrice: number | null = null;
+        let histDate: string | null = null;
+        let reason: string | null = leg.price_unavailable_reason;
+        if (isHistoricalLeg) {
+          const hist = await fetchHistoricalPrice(leg.ticker, leg.trade_date!, userAuth);
+          if (hist) {
+            histPrice = hist.close_price;
+            histDate = hist.date;
+            quote = {
+              ticker: leg.ticker,
+              current_price: hist.close_price,
+              previous_close: null,
+              change_pct: null,
+              day_high: null,
+              day_low: null,
+              company_name: null,
+              sector: null,
+              last_updated: new Date().toISOString(),
+              from_cache: false,
+            };
+            reason = null;
+          } else {
+            const live = await ensureFreshQuote(leg.ticker, userAuth);
+            quote = live.quote;
+            if (!live.quote) reason = `historical: ${live.unavailable_reason}`;
+          }
+        } else {
+          const live = await ensureFreshQuote(leg.ticker, userAuth);
+          quote = live.quote;
+          reason = live.unavailable_reason;
+        }
+
+        // Fuzzy ticker correction: only when the user's ticker is
+        // unknown to Bloomberg. We never auto-correct a valid ticker.
+        let suggestion: string | null = null;
+        if (!quote) {
+          suggestion = suggestTickerCorrection(leg.ticker);
+        }
+
+        const displayPrice = histPrice ?? quote?.current_price ?? null;
+        const ctx = quote
+          ? (histPrice
+              ? `Market data for ${leg.ticker} as of ${histDate}: close=$${histPrice.toFixed(2)}, source=bloomberg historical.`
+              : formatMarketContext(quote, leg.ticker))
+          : `Market data for ${leg.ticker}: unavailable${reason ? ` (${reason})` : ''}.`;
+
+        // Per-leg preview_qty: only meaningful for notional-based legs
+        // (the user spoke in USD, not shares). Compute it here so the
+        // UI can populate the qty box immediately. Authoritative qty
+        // is recomputed at execute time by executeTrade().
+        let legPreviewQty: number | null = null;
+        if (
+          displayPrice != null &&
+          displayPrice > 0 &&
+          leg.notional != null &&
+          leg.notional > 0
+        ) {
+          legPreviewQty = Math.floor(leg.notional / displayPrice);
+        }
+
+        return {
+          ...leg,
+          market_price: displayPrice,
+          market_change_pct: quote?.change_pct ?? null,
+          market_context: ctx,
+          resolved_price: displayPrice,
+          preview_qty: legPreviewQty,
+          from_cache: quote?.from_cache ?? null,
+          price_unavailable_reason: reason,
+          ticker_suggestion: suggestion,
+          company_name: quote?.company_name ?? null,
+          sector: quote?.sector ?? null,
+        };
+      }));
+
+      // Build the canonical response. legs[] is ALWAYS populated
+      // (>= 1 element). The legacy flat fields mirror the primary
+      // (first) leg for back-compat with the existing frontend.
+      const primary = legResults[0];
+      const isMulti = legResults.length > 1;
+      const isHistorical = legResults.some(
+        (l) => l.trade_date != null && l.trade_date < todayIso,
+      );
       const finalParsed: ParsedCommand = {
         ...parsed,
-        ticker: finalTicker,
-        trade_date: finalTradeDate,
-        time_of_day: finalTimeOfDay,
-        is_historical: finalIsHistorical,
+        legs: legResults,
+        is_historical: isHistorical,
+        // Legacy back-compat fields (mirror primary leg):
+        action: primary.action,
+        direction: primary.direction,
+        ticker: primary.ticker || null,
+        qty: primary.qty,
+        price_type: primary.price_type,
+        limit_price: primary.limit_price,
+        stop_loss_pct: primary.stop_loss_pct,
+        trade_date: primary.trade_date,
+        time_of_day: primary.time_of_day,
+        notional: primary.notional,
+        ticker_suggestion: primary.ticker_suggestion,
+        price_unavailable_reason: primary.price_unavailable_reason,
       };
 
-      const resolvedPrice =
-        finalParsed.limit_price ?? historicalPrice ?? marketQuote?.current_price ?? null;
-      const displayPrice = historicalPrice ?? marketQuote?.current_price ?? null;
-
       // Informational preview only — the system, not the LLM, owns
-      // the authoritative qty. The frontend shows this so the user
-      // can see ~how many shares the notional will buy at the
-      // displayed price; the actual qty is recomputed at click time
-      // by executeTrade() using the freshest cached price.
+      // the authoritative qty. Aggregated across all notional-based
+      // legs (each leg has its own preview_qty; the top-level preview
+      // is the sum so the chat-bubble explanation stays meaningful for
+      // multi-leg notional commands).
       let previewQty: number | null = null;
-      if (finalParsed.notional != null && resolvedPrice != null && resolvedPrice > 0) {
-        previewQty = Math.floor(finalParsed.notional / resolvedPrice);
-        finalParsed.preview_qty = previewQty;
+      for (const l of legResults) {
+        if (l.preview_qty != null) {
+          previewQty = (previewQty ?? 0) + l.preview_qty;
+        }
+      }
+      finalParsed.preview_qty = previewQty;
+      if (previewQty != null && previewQty > 0 && isMulti) {
         finalParsed.explanation = (finalParsed.explanation || '') +
-          ` (preview: ~${previewQty.toLocaleString()} sh @ $${resolvedPrice.toFixed(2)}; resolved at execute time)`;
+          ` (preview: ~${previewQty.toLocaleString()} total sh; resolved at execute time)`;
+      } else if (previewQty != null && previewQty > 0) {
+        const resolvedPrice = primary.resolved_price ?? primary.market_price ?? null;
+        if (resolvedPrice != null && resolvedPrice > 0) {
+          finalParsed.explanation = (finalParsed.explanation || '') +
+            ` (preview: ~${previewQty.toLocaleString()} sh @ $${resolvedPrice.toFixed(2)}; resolved at execute time)`;
+        }
+      }
+      // Multi-leg summary line.
+      if (isMulti) {
+        const actionLabel: Record<LegAction, string> = {
+          BUY: 'Buy', SELL: 'Sell', CLOSE: 'Close', SHORT: 'Short', COVER: 'Cover',
+        };
+        const legSummary = legResults
+          .map((l) => {
+            const verb = actionLabel[l.action];
+            const size = l.qty != null
+              ? ` ${l.qty}`
+              : l.notional != null
+                ? ` $${l.notional.toLocaleString()}`
+                : l.notional_basis === 'PCT_PORTFOLIO' || l.notional_basis === 'PCT_CASH'
+                  ? ` ${l.notional_pct ?? 0}%${l.notional_basis === 'PCT_CASH' ? ' of cash' : ''}`
+                  : l.notional_basis === 'FRACTION_PORTFOLIO' || l.notional_basis === 'FRACTION_CASH'
+                    ? ` ${formatFraction(l.notional_fraction ?? 0)}${l.notional_basis === 'FRACTION_CASH' ? ' of cash' : ''}`
+                    : '';
+            const date = l.trade_date ? ` (${l.trade_date})` : '';
+            return `${verb}${size} ${l.ticker}${date}`;
+          })
+          .join(' + ');
+        finalParsed.explanation =
+          `${finalParsed.explanation || `Multi-leg trade`} (${legResults.length} legs: ${legSummary})`;
+      } else {
+        // Single-leg explanation, with date if any.
+        const actionLabel: Record<LegAction, string> = {
+          BUY: 'Buy', SELL: 'Sell', CLOSE: 'Close', SHORT: 'Short', COVER: 'Cover',
+        };
+        const verb = actionLabel[primary.action];
+        const size = primary.qty != null
+          ? ` ${primary.qty}`
+          : primary.notional != null
+            ? ` $${primary.notional.toLocaleString()}`
+            : primary.notional_basis === 'PCT_PORTFOLIO' || primary.notional_basis === 'PCT_CASH'
+              ? ` ${primary.notional_pct ?? 0}%${primary.notional_basis === 'PCT_CASH' ? ' of cash' : ''}`
+              : primary.notional_basis === 'FRACTION_PORTFOLIO' || primary.notional_basis === 'FRACTION_CASH'
+                ? ` ${formatFraction(primary.notional_fraction ?? 0)}${primary.notional_basis === 'FRACTION_CASH' ? ' of cash' : ''}`
+                : '';
+        const dateSuffix = primary.trade_date ? ` on ${primary.trade_date}` : '';
+        const todSuffix = primary.time_of_day ? ` at ${primary.time_of_day}` : '';
+        finalParsed.explanation = finalParsed.explanation ||
+          `${verb}${size} ${primary.ticker}${dateSuffix}${todSuffix}`;
       }
 
       // Verify the LLM-supplied portfolio_id actually belongs to this
@@ -1329,16 +2429,117 @@ serve(async (req: Request) => {
       // re-run the LLM.
       cacheSet(cacheKey, finalParsed);
 
+      // Final guard: re-sanitize every leg's ticker one last time.
+      // No stopword can ever reach the browser as a ticker.
+      const responseLegs = finalParsed.legs
+        .filter((l) => l.ticker && !STOPWORDS.has(l.ticker.toUpperCase()))
+        .map((l) => ({ ...l, ticker: l.ticker.toUpperCase() }));
+      const responseTicker = responseLegs[0]?.ticker ?? null;
+
+      // Convenience flat fields for the frontend's market-price
+      // header (it still reads these directly).
+      const displayPrice = primary.market_price ?? null;
+      const marketContext = primary.market_context ?? '';
+
       return jsonResponse({
         success: true,
         data: {
           ...finalParsed,
+          legs: responseLegs,
+          ticker: responseTicker,
+          action: responseLegs[0]?.action ?? finalParsed.action,
+          direction: responseLegs[0]?.direction ?? finalParsed.direction,
+          qty: responseLegs[0]?.qty ?? null,
+          price_type: responseLegs[0]?.price_type ?? 'MARKET',
+          limit_price: responseLegs[0]?.limit_price ?? null,
+          stop_loss_pct: responseLegs[0]?.stop_loss_pct ?? null,
+          trade_date: responseLegs[0]?.trade_date ?? null,
+          time_of_day: responseLegs[0]?.time_of_day ?? null,
+          notional: responseLegs[0]?.notional ?? null,
+          // Per-leg sizing basis (mirror primary leg for the legacy
+          // flat-field reads the frontend still does).
+          notional_basis: responseLegs[0]?.notional_basis ?? 'USD',
+          notional_pct: responseLegs[0]?.notional_pct ?? null,
+          notional_fraction: responseLegs[0]?.notional_fraction ?? null,
           market_price: displayPrice,
-          market_change_pct: marketQuote?.change_pct ?? null,
+          market_change_pct: primary.market_change_pct ?? null,
           market_context: marketContext,
-          resolved_price: resolvedPrice,
-          from_cache: marketQuote?.from_cache ?? null,
-          price_unavailable_reason: priceUnavailableReason,
+          resolved_price: responseLegs[0]?.resolved_price ?? null,
+          from_cache: primary.from_cache ?? null,
+        },
+      });
+    }
+
+    // Fast quote lookup. The frontend hits this on every blur of a
+    // leg's ticker/qty input so the user gets a near-instant refresh
+    // (sub-300ms typical). It runs the SAME price resolution pipeline
+    // as /parse's per-leg path, but skips the LLM call entirely.
+    //
+    // Response shape mirrors a single ParsedLeg so the frontend can
+    // splice it into `parsed.legs[idx]` without a translation layer.
+    if (req.method === 'POST' && route === 'quote') {
+      let body: any;
+      try {
+        body = await req.json();
+      } catch {
+        return jsonResponse({ success: false, error: 'Body must be JSON' }, 400);
+      }
+      const ticker = (body?.ticker ?? '').toString().toUpperCase().trim();
+      if (!ticker) {
+        return jsonResponse(
+          { success: false, error: '`ticker` (string) is required' },
+          400,
+        );
+      }
+      // Reject stopword tickers up front — same guard as the parse
+      // path, keeps the UI's "red box for unrecognised" signal honest.
+      if (STOPWORDS.has(ticker)) {
+        return jsonResponse({
+          success: true,
+          data: {
+            ticker,
+            market_price: null,
+            market_change_pct: null,
+            resolved_price: null,
+            preview_qty: null,
+            price_unavailable_reason: `"${ticker}" is a reserved word, not a ticker`,
+            ticker_suggestion: null,
+            company_name: null,
+            from_cache: null,
+          },
+        });
+      }
+      // Step 1: Levenshtein correction. If the user typed "APPL"
+      // and AAPL is a known ticker, surface the suggestion so the
+      // UI can offer a "Did you mean AAPL?" affordance without
+      // ever calling the LLM.
+      const tickerSuggestion = suggestTickerCorrection(ticker);
+      // If we have a clear correction, swap the ticker in for the
+      // price lookup. The original (with the suggestion attached)
+      // is still returned so the UI can ask the user first.
+      const lookupTicker = tickerSuggestion ?? ticker;
+      // Step 2: resolve a live/fresh quote. This is the only
+      // potentially slow call (~50-200ms on cache hit, up to ~1s if
+      // we have to hit the bloomberg relay). No LLM involved.
+      const { quote, unavailable_reason } = await ensureFreshQuote(
+        lookupTicker,
+        userAuth,
+      );
+      // If we had to apply a Levenshtein correction AND the lookup
+      // succeeded, the suggestion is no longer "did you mean?" — it's
+      // "we auto-corrected". We still keep it on the response so the
+      // UI can show a green confirmation chip if it wants to.
+      return jsonResponse({
+        success: true,
+        data: {
+          ticker,
+          ticker_suggestion: tickerSuggestion,
+          market_price: quote?.current_price ?? null,
+          market_change_pct: quote?.change_pct ?? null,
+          resolved_price: quote?.current_price ?? null,
+          price_unavailable_reason: unavailable_reason,
+          company_name: quote?.company_name ?? null,
+          from_cache: quote?.from_cache ?? null,
         },
       });
     }

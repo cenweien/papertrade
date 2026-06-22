@@ -13,6 +13,8 @@ GET  /quotes?tickers=AAPL,TSLA                -> batched quotes
 POST /refresh?ticker=AAPL                     -> force-refresh a ticker
 GET  /search?q=apple                          -> ticker search (uses bds)
 GET  /historical?ticker=AAPL&date=2026-06-09  -> historical close
+GET  /history-series?tickers=AAPL,MSFT&start=2025-06-22&end=2026-06-22
+                                          -> multi-day, multi-ticker history
 GET  /resolve?ticker=ES1                      -> asset-class + bbg symbol
 GET  /healthz                                 -> liveness check (no Bloomberg call)
 
@@ -33,6 +35,7 @@ load_dotenv()
 import os
 import logging
 import re
+import threading
 from datetime import date as date_type, datetime, timedelta, timezone
 from typing import Optional
 
@@ -55,6 +58,32 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("bloomberg-relay")
+
+# -----------------------------------------------------------------------------
+# Bloomberg session lock
+# -----------------------------------------------------------------------------
+# `xbbg_sapi` wraps blpapi's synchronous session, which is a process-global
+# singleton. The wheel's `bdp()` flushes pending events before sending and
+# then drains the response synchronously. If two HTTP requests hit
+# `bdp()` concurrently from FastAPI's threadpool, thread B's flush
+# drains thread A's pending events, and both responses come back
+# incomplete (manifesting as "Empty quote for X" 404s even though
+# Bloomberg has the data). Serialise every Bloomberg call through this
+# lock. There is no real concurrency to lose: the underlying SAPI session
+# is single-threaded and a `bdp()` call takes ~400ms anyway.
+_BBG_LOCK = threading.Lock()
+
+
+def _bdp(tickers, flds, **kwargs):
+    """Thread-safe wrapper around xbbg_sapi.bdp()."""
+    with _BBG_LOCK:
+        return bdp(tickers, flds, **kwargs)
+
+
+def _bdh(tickers, flds, start, end, **kwargs):
+    """Thread-safe wrapper around xbbg_sapi.bdh()."""
+    with _BBG_LOCK:
+        return bdh(tickers, flds, start, end, **kwargs)
 
 # -----------------------------------------------------------------------------
 # Config from env (override the hardcoded defaults in xbbg_sapi)
@@ -123,6 +152,15 @@ class HistoricalQuote(BaseModel):
     close_price: float
     company_name: Optional[str] = None
 
+class HistoryPoint(BaseModel):
+    date: str
+    close: float
+
+class HistorySeries(BaseModel):
+    ticker: str
+    asset_class: Optional[str] = None
+    points: list[HistoryPoint]
+
 class SearchResult(BaseModel):
     ticker: str
     description: str
@@ -168,12 +206,27 @@ def _get_column(df: pd.DataFrame, name: str):
 
     bdh() returns a DataFrame whose columns are typically lowercase ('px_last'),
     but we accept any casing so the endpoint survives future wheel versions.
+
+    Note: xbbg_sapi's bdh() may return a MultiIndex column
+    (('TICKER', 'PX_LAST')) when called with a single ticker, instead
+    of a flat index. The flat lookups below handle both cases.
     """
     if name in df.columns:
         return name
     for candidate in (name.lower(), name.upper(), name.title()):
         if candidate in df.columns:
             return candidate
+    # MultiIndex columns: xbbg_sapi returns columns as a tuple of
+    # (ticker, field) when given a single ticker. The field is the
+    # second element of each tuple. Try every level-1 value against
+    # the requested name and its case variants.
+    if isinstance(df.columns, pd.MultiIndex):
+        for candidate in (name, name.lower(), name.upper(), name.title()):
+            matches = [col for col in df.columns
+                       if isinstance(col, tuple) and len(col) >= 2
+                       and col[-1] == candidate]
+            if matches:
+                return matches[0]
     return None
 
 
@@ -290,7 +343,7 @@ def quote(
     bare = strip_to_bare_ticker(bbg)
     fields = _fields_for(ref.asset_class)
     try:
-        df = bdp([bbg], fields)
+        df = _bdp([bbg], fields)
     except Exception as exc:
         log.exception("bdp failed for %s", bbg)
         raise HTTPException(status_code=502, detail=f"Bloomberg error: {exc}")
@@ -362,7 +415,7 @@ def quotes(
     for cls, items in by_class.items():
         bbg_list = [b for _, b in items]
         try:
-            df = bdp(bbg_list, _fields_for(cls))
+            df = _bdp(bbg_list, _fields_for(cls))
         except Exception as exc:
             log.exception("bdp failed for %s", bbg_list)
             df = None
@@ -507,7 +560,7 @@ def historical(
     end = target_date.strftime("%Y-%m-%d")
 
     try:
-        df = bdh(bbg, ["PX_LAST"], start, end)
+        df = _bdh(bbg, ["PX_LAST"], start, end)
     except Exception as exc:
         log.exception("bdh failed for %s [%s..%s]", bbg, start, end)
         raise HTTPException(status_code=502, detail=f"Bloomberg error: {exc}")
@@ -544,7 +597,7 @@ def historical(
     # 6. Optional company name via bdp() (best-effort, separate call).
     company_name: Optional[str] = None
     try:
-        name_df = bdp([bbg], ["LONG_COMP_NAME"])
+        name_df = _bdp([bbg], ["LONG_COMP_NAME"])
         if name_df is not None and not name_df.empty and bbg in name_df.index:
             name_col = _get_field(name_df.loc[bbg], "LONG_COMP_NAME")
             if name_col is not None and not pd.isna(name_col):
@@ -565,3 +618,139 @@ def historical(
         company_name=company_name,
     )
     return {"success": True, "data": payload.model_dump()}
+
+
+@app.get("/history-series", dependencies=[Depends(require_api_key)])
+def history_series(
+    tickers: str = Query(..., description="Comma-separated tickers, e.g. 'AAPL,MSFT,GOOGL'"),
+    start: str = Query(..., description="Start date (YYYY-MM-DD), inclusive"),
+    end: str = Query(..., description="End date (YYYY-MM-DD), inclusive"),
+) -> dict:
+    """Multi-day, multi-ticker close-price history.
+
+    Powers the Risk page's market-derived Sharpe / VaR / CVaR / Sortino
+    metrics. For each requested ticker we ask Bloomberg for the daily
+    PX_LAST over [start..end] and return one normalised series.
+
+    The Supabase `instrument_price_history` cache front-ends this so the
+    Risk page only hits the relay for the rows that aren't already
+    cached — see `market-data/historical-series` edge function.
+
+    The response is `{"success": true, "data": [HistorySeries, ...]}`
+    matching the rest of the relay. Tickers that Bloomberg has no data
+    for are returned with an empty `points` array and logged at WARNING
+    so the caller can decide whether to fail or proceed.
+    """
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", start) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", end):
+        raise HTTPException(status_code=400, detail="start/end must be YYYY-MM-DD")
+    try:
+        start_d = datetime.strptime(start, "%Y-%m-%d").date()
+        end_d = datetime.strptime(end, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid date: {exc}")
+    if end_d < start_d:
+        raise HTTPException(status_code=400, detail="end must be >= start")
+
+    # Parse + de-duplicate tickers while preserving order.
+    raw_tickers = [t.strip() for t in tickers.split(",") if t.strip()]
+    if not raw_tickers:
+        raise HTTPException(status_code=400, detail="No tickers provided")
+    if len(raw_tickers) > 50:
+        raise HTTPException(status_code=400, detail="Too many tickers (max 50)")
+
+    # Resolve each ticker to its BBG symbol once (cheap; cached internally).
+    resolved: list[tuple[str, str, Optional[str]]] = []
+    for t in raw_tickers:
+        try:
+            ref = resolve_instrument(t)
+            resolved.append((strip_to_bare_ticker(ref.bbg_symbol), ref.bbg_symbol, ref.asset_class))
+        except HTTPException:
+            log.warning("history-series: cannot resolve ticker '%s'", t)
+            resolved.append((t.upper(), None, None))
+
+    # Group by BBG symbol so a single bdh() returns multiple tickers in one
+    # B-PIPE request — same rate-limiter friendliness rationale as the
+    # batched /quotes endpoint (see fetchBloombergQuotes in market-data).
+    bbg_to_bare: dict[str, list[str]] = {}
+    bbg_to_class: dict[str, Optional[str]] = {}
+    for bare, bbg, cls in resolved:
+        if not bbg:
+            continue
+        bbg_to_bare.setdefault(bbg, []).append(bare)
+        bbg_to_class[bbg] = cls
+
+    # Result keyed by bare ticker (always uppercase).
+    out: dict[str, HistorySeries] = {
+        bare: HistorySeries(ticker=bare, asset_class=cls, points=[])
+        for bare, _, cls in resolved
+    }
+
+    if bbg_to_bare:
+        try:
+            df = _bdh(list(bbg_to_bare.keys()), ["PX_LAST"], start, end)
+        except Exception as exc:
+            log.exception("history-series bdh failed for %d tickers", len(bbg_to_bare))
+            raise HTTPException(status_code=502, detail=f"Bloomberg error: {exc}")
+
+        if df is not None and not df.empty:
+            # bdh() column shape varies by wheel version (flat, multiindex,
+            # ticker-suffixed). For each BBG symbol we need the PX_LAST
+            # column for any of its bare-ticker aliases.
+            col_name = _get_column(df, "PX_LAST")
+            for bbg, bares in bbg_to_bare.items():
+                series_for_bbg = _extract_bbg_series(df, bbg, col_name)
+                for bare in bares:
+                    pts = out[bare]
+                    for ts, val in series_for_bbg:
+                        if val is None or pd.isna(val):
+                            continue
+                        date_str = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
+                        pts.points.append(HistoryPoint(date=date_str, close=float(val)))
+        for bare, series in out.items():
+            if not series.points:
+                log.warning("history-series: no PX_LAST for %s in [%s..%s]", bare, start, end)
+
+    return {"success": True, "data": [s.model_dump() for s in out.values()]}
+
+
+def _extract_bbg_series(df: pd.DataFrame, bbg: str, col_name: Optional[str]):
+    """Pull a (timestamp, value) iterable out of a bdh() DataFrame for one BBG symbol.
+
+    Handles three shapes seen across wheel versions:
+      1. Flat columns: ['PX_LAST']                              (single ticker)
+      2. MultiIndex columns: [(ticker, field)]                  (multi ticker)
+      3. Ticker-suffixed columns: ['AAPL US Equity PX_LAST']    (multi ticker, flat)
+
+    Returns list[(ts, value | None)]. Callers filter out None / NaN.
+    """
+    out_pairs: list = []
+    if df is None or df.empty:
+        return out_pairs
+
+    # Case 1: single ticker, flat column.
+    if col_name is not None and not isinstance(df.columns, pd.MultiIndex):
+        if bbg in df.index and col_name in df.columns:
+            for ts, val in df[col_name].items():
+                out_pairs.append((ts, val))
+            return out_pairs
+
+    # Case 2: MultiIndex (ticker, field).
+    if isinstance(df.columns, pd.MultiIndex):
+        for col in df.columns:
+            if not (isinstance(col, tuple) and len(col) == 2):
+                continue
+            tk, fld = col
+            if tk == bbg and fld.lower() == "px_last":
+                for ts, val in df[col].items():
+                    out_pairs.append((ts, val))
+                return out_pairs
+
+    # Case 3: ticker-suffixed flat column.
+    if col_name is not None:
+        for c in df.columns:
+            if isinstance(c, str) and c.endswith(f" {col_name}") and c.startswith(bbg):
+                for ts, val in df[c].items():
+                    out_pairs.append((ts, val))
+                return out_pairs
+
+    return out_pairs

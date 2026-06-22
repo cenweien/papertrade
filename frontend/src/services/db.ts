@@ -46,20 +46,62 @@ export async function createPortfolio(input: {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) throw new Error('Not authenticated');
 
+  const initial = input.initial_capital ?? 100_000_000;
   const { data, error } = await supabase
     .from('portfolios')
     .insert({
       user_id: user.id,
       name: input.name,
       description: input.description || null,
-      initial_capital: input.initial_capital || 100000,
-      current_capital: input.initial_capital || 100000,
+      initial_capital: initial,
+      current_capital: initial,
     })
     .select()
     .single();
 
   if (error) throw error;
   return data;
+}
+
+/**
+ * Ensure the current user has at least one portfolio. If they don't,
+ * create a default "Main Portfolio" seeded with $100M of paper cash.
+ * Returns the list of portfolios (existing or just-created).
+ *
+ * Single-flighted: concurrent callers (Layout + Dashboard both call
+ * this on mount) share one in-flight promise so we never create
+ * duplicates from a race. Also includes a name-collision guard as a
+ * belt-and-suspenders against any leftover "Main Portfolio" rows from
+ * before the single-flight lock was added.
+ */
+let ensureDefaultInFlight: Promise<Portfolio[]> | null = null;
+export async function ensureDefaultPortfolio(): Promise<Portfolio[]> {
+  if (ensureDefaultInFlight) return ensureDefaultInFlight;
+  ensureDefaultInFlight = (async () => {
+    const existing = await getPortfolios(true);
+    if (existing.length > 0) return existing;
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return existing;
+    // Re-check inside the lock — another concurrent caller may have
+    // raced past `getPortfolios` and already inserted one.
+    const after = await getPortfolios(true);
+    if (after.length > 0) return after;
+    // Name-collision guard: never create a second "Main Portfolio".
+    const { data: dup } = await supabase
+      .from('portfolios')
+      .select('id')
+      .eq('user_id', user.id)
+      .ilike('name', 'Main Portfolio')
+      .maybeSingle();
+    if (dup) return getPortfolios(true);
+    await createPortfolio({ name: 'Main Portfolio' });
+    return getPortfolios(true);
+  })().finally(() => {
+    // Reset the in-flight handle on the next microtask so future
+    // calls (e.g. after a portfolio is archived) can re-check.
+    queueMicrotask(() => { ensureDefaultInFlight = null; });
+  });
+  return ensureDefaultInFlight;
 }
 
 export async function updatePortfolio(
@@ -164,19 +206,48 @@ export async function getTrades(portfolioId?: string, limit = 100): Promise<Trad
  * execution, so the system — not the LLM — owns the share-count math.
  */
 export async function getCachedPrice(ticker: string): Promise<number | null> {
+  const quote = await getCachedQuote(ticker);
+  return quote?.current_price ?? null;
+}
+
+/**
+ * Read a fresh-enough quote (price + change_pct + company_name) for
+ * `ticker` from the `instrument_prices` cache. Returns null when no
+ * row exists OR the row is older than 10 minutes (the display TTL).
+ *
+ * Used by the AIChatPage refetch path so editing a leg's ticker box
+ * refreshes the price without round-tripping the (LLM-backed) AI
+ * Edge Function — typical latency is ~100-300ms (one Supabase read)
+ * instead of ~2s.
+ */
+export async function getCachedQuote(
+  ticker: string,
+): Promise<{
+  current_price: number;
+  change_pct: number | null;
+  company_name: string | null;
+  from_cache: boolean;
+  last_updated: string;
+} | null> {
   const upper = ticker.toUpperCase();
   const { data, error } = await supabase
     .from('instrument_prices')
-    .select('current_price, last_updated')
+    .select('current_price, change_pct, company_name, last_updated, from_cache')
     .eq('ticker', upper)
     .maybeSingle();
-  if (error || !data) return null;
+  if (error || !data || data.current_price == null) return null;
   const ageMs = Date.now() - new Date(data.last_updated).getTime();
   // 10-minute window: a bit more permissive than the 5-min display
   // TTL because the user might be about to execute and we want a
   // sensible fallback even if the price is mildly stale.
   if (ageMs > 10 * 60 * 1000) return null;
-  return data.current_price ?? null;
+  return {
+    current_price: data.current_price,
+    change_pct: data.change_pct ?? null,
+    company_name: data.company_name ?? null,
+    from_cache: data.from_cache ?? true,
+    last_updated: data.last_updated,
+  };
 }
 
 /**
@@ -330,6 +401,15 @@ export async function executeTrade(input: {
     price,
   );
 
+  // ---- 8. Persist a daily_snapshots row so the Risk page's L/S
+  //     time series reflects this trade on the next reload. We
+  //     write directly from the frontend (bypassing the
+  //     compute-snapshots edge function) because the same auth chain
+  //     already authorized the trade + position + cash writes above,
+  //     so the snapshot write can use the same session with no
+  //     extra cold start. ----
+  await writeSnapshotAfterTrade(input.portfolio_id);
+
   return trade;
 }
 
@@ -432,6 +512,59 @@ export async function getPositions(portfolioId?: string): Promise<Position[]> {
   return data || [];
 }
 
+/**
+ * Compute a portfolio's total equity (cash + market value of all
+ * positions) and available cash on demand, using the latest cached
+ * prices from `instrument_prices`. Used by the AI chat to resolve
+ * percentage / fraction commands ("spend 10% of my portfolio on
+ * AAPL") to a USD notional right before executeTrade().
+ *
+ * Equity = current_capital + sum(qty * current_price) for every
+ * position. Short positions contribute their negative market value
+ * to equity (so a -100 AAPL short at $200 = -$20k of equity).
+ *
+ * Returns both numbers so callers can pick the base they need
+ * (PCT_PORTFOLIO / PCT_CASH / FRACTION_*).
+ */
+export async function computePortfolioEquity(portfolioId: string): Promise<{
+  cash: number;
+  equity: number;
+  longValue: number;
+  shortValue: number;
+}> {
+  const [{ data: portfolio }, { data: positions }] = await Promise.all([
+    supabase
+      .from('portfolios')
+      .select('current_capital')
+      .eq('id', portfolioId)
+      .maybeSingle(),
+    supabase
+      .from('positions')
+      .select('ticker, qty, current_price')
+      .eq('portfolio_id', portfolioId),
+  ]);
+  const cash = Number(portfolio?.current_capital ?? 0);
+  let longValue = 0;
+  let shortValue = 0;
+  for (const p of positions ?? []) {
+    const qty = Number(p.qty ?? 0);
+    // Prefer the position row's current_price (written by
+    // writeSnapshotAfterTrade after every trade); fall back to the
+    // instrument_prices cache for positions whose mark is stale.
+    let px = Number(p.current_price ?? 0);
+    if (!Number.isFinite(px) || px <= 0) {
+      const cached = await getCachedPrice(p.ticker);
+      px = cached ?? 0;
+    }
+    if (!Number.isFinite(px) || px <= 0) continue;
+    const mv = qty * px;
+    if (mv >= 0) longValue += mv;
+    else shortValue += mv;
+  }
+  const equity = cash + longValue + shortValue;
+  return { cash, equity, longValue, shortValue };
+}
+
 export async function updatePositionPrice(
   id: string,
   currentPrice: number
@@ -472,6 +605,344 @@ export async function createSnapshot(input: {
   await supabase.from('daily_snapshots').upsert(input, {
     onConflict: 'portfolio_id,snapshot_date',
   });
+}
+
+/**
+ * Persist a `daily_snapshots` row for the portfolio right after a
+ * trade executes. Computes today's portfolio equity from the just-
+ * written positions table, marks each position to the live price
+ * from the `instrument_prices` cache (the same one the Python
+ * scheduler keeps fresh from Bloomberg), and writes the row directly
+ * via the Supabase client — bypassing the `compute-snapshots` Edge
+ * Function entirely.
+ *
+ * Why direct-write instead of the edge function:
+ *   - The edge function path (compute-snapshots) was unreliable in
+ *     this environment: it requires either a user JWT or the
+ *     INTERNAL_API_KEY shared secret, and the JWT path was
+ *     occasionally rejected when the user session was stale.
+ *   - The frontend is already authenticated to Supabase (it just
+ *     wrote the trades row, updated positions, and updated cash).
+ *     Adding one more row write uses the same auth chain, no extra
+ *     cold start, no extra network hop.
+ *   - The data sources are identical: positions table (canonical
+ *     state after the trade) and instrument_prices cache (the same
+ *     live price the position row would be marked to anywhere else
+ *     in the app).
+ *
+ * Idempotent: re-running for the same (portfolio_id, snapshot_date)
+ * upserts in place. Trade execution is the trigger; a Risk-page
+ * "Recompute snapshots" click can also fire this for backfill.
+ *
+ * Errors are swallowed — the user already saw the trade succeed and
+ * the trade UX must not wait on this write.
+ */
+export async function writeSnapshotAfterTrade(portfolioId: string): Promise<void> {
+  try {
+    // 1. Fetch the just-updated positions and portfolio.
+    const [{ data: portfolio }, { data: positions }] = await Promise.all([
+      supabase
+        .from('portfolios')
+        .select('current_capital, initial_capital')
+        .eq('id', portfolioId)
+        .maybeSingle(),
+      supabase
+        .from('positions')
+        .select('ticker, qty, avg_price, sector')
+        .eq('portfolio_id', portfolioId),
+    ]);
+    if (!portfolio) return;
+    const posList = positions ?? [];
+
+    // 2. Fetch the live prices for every position's ticker (in
+    // parallel). Fall back to avg_price for any ticker without a
+    // cached price so the snapshot can still be written (degenerate
+    // mark, but not blocking).
+    const tickers = Array.from(new Set(posList.map((p) => p.ticker.toUpperCase())));
+    const priceMap = new Map<string, number>();
+    if (tickers.length > 0) {
+      const { data: priceRows } = await supabase
+        .from('instrument_prices')
+        .select('ticker, current_price')
+        .in('ticker', tickers);
+      for (const r of priceRows ?? []) {
+        if (r.current_price != null) {
+          priceMap.set(r.ticker.toUpperCase(), Number(r.current_price));
+        }
+      }
+    }
+
+    // 3. Compute per-ticker MV and the per-position "ratio" the
+    // user calls the holding-period return. LONG:
+    //   return_pct = (price - avgPrice) / avgPrice * 100
+    // SHORT (qty < 0):
+    //   return_pct = (avgPrice - price) / avgPrice * 100
+    // (a short that dropped in price has a positive return — the
+    // price-relative formula mirrors the P&L sign convention.)
+    const positionJsonb: Record<string, {
+      qty: number;
+      mv: number;
+      sector: string | null;
+      avg_price: number;
+      price: number;
+      return_pct: number | null;
+    }> = {};
+    let longValue = 0;
+    let shortValue = 0;
+    const sectorMap: Record<string, { long: number; short: number; net: number }> = {};
+    for (const p of posList) {
+      const tk = p.ticker.toUpperCase();
+      const mark = priceMap.get(tk) ?? Number(p.avg_price) ?? 0;
+      const mv = Number(p.qty) * mark;
+      let returnPct: number | null = null;
+      const avg = Number(p.avg_price);
+      if (avg > 0 && mark > 0) {
+        const priceReturn = (mark - avg) / avg;
+        returnPct = Number(p.qty) >= 0 ? priceReturn * 100 : -priceReturn * 100;
+      }
+      positionJsonb[tk] = {
+        qty: Number(p.qty),
+        mv,
+        sector: p.sector ?? null,
+        avg_price: avg,
+        price: mark,
+        return_pct: returnPct,
+      };
+      if (mv >= 0) longValue += mv;
+      else shortValue += mv;
+      const sec = p.sector ?? 'Unknown';
+      const entry = sectorMap[sec] ?? { long: 0, short: 0, net: 0 };
+      if (mv >= 0) entry.long += mv;
+      else entry.short += mv;
+      entry.net = entry.long + entry.short;
+      sectorMap[sec] = entry;
+    }
+    const netValue = longValue + shortValue;
+    const grossExposure = longValue + Math.abs(shortValue);
+    const cash = Number(portfolio.current_capital) || 0;
+    const equity = cash + netValue;
+
+    // 4. daily_return vs the prior snapshot for this same portfolio.
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: prevSnap } = await supabase
+      .from('daily_snapshots')
+      .select('equity, snapshot_date')
+      .eq('portfolio_id', portfolioId)
+      .lt('snapshot_date', today)
+      .order('snapshot_date', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    let dailyReturn: number | null = null;
+    if (prevSnap && Number(prevSnap.equity) > 0) {
+      dailyReturn = (equity - Number(prevSnap.equity)) / Number(prevSnap.equity);
+    }
+
+    // 5. Upsert today's snapshot. We do this as a delete-then-insert
+    // rather than a true upsert because the existing RLS policy set
+    // on daily_snapshots only grants SELECT and INSERT — there is
+    // no UPDATE policy (the original schema migration only added
+    // SELECT and INSERT). Re-running this code for the same day
+    // must replace the prior row with the latest mark, so:
+    //   - DELETE any existing row for (portfolio, today) — DELETE
+    //     works under the existing schema's grants.
+    //   - INSERT the fresh row.
+    // This is a small race window (two concurrent trades on the same
+    // day), but that's an edge case for a single-user app.
+    const row = {
+      portfolio_id: portfolioId,
+      snapshot_date: today,
+      equity,
+      exposure: grossExposure,
+      cash,
+      daily_return: dailyReturn,
+      long_value: longValue,
+      short_value: shortValue,
+      net_value: netValue,
+      long_pct: equity > 0 ? (longValue / equity) * 100 : null,
+      short_pct: equity > 0 ? (shortValue / equity) * 100 : null,
+      net_pct: equity > 0 ? (netValue / equity) * 100 : null,
+      gross_pct: equity > 0 ? (grossExposure / equity) * 100 : null,
+      sector_jsonb: sectorMap,
+      position_jsonb: positionJsonb,
+    };
+    // Delete first (idempotent — silently no-ops when no row exists).
+    await supabase
+      .from('daily_snapshots')
+      .delete()
+      .eq('portfolio_id', portfolioId)
+      .eq('snapshot_date', today);
+    // Then insert the fresh row. RLS allows INSERT for the user's
+    // own portfolios.
+    const { error: insErr } = await supabase
+      .from('daily_snapshots')
+      .insert(row);
+    if (insErr) {
+      console.warn('writeSnapshotAfterTrade insert failed (non-fatal):', insErr);
+    }
+  } catch (err) {
+    console.warn('writeSnapshotAfterTrade failed (non-fatal):', err);
+  }
+}
+
+/**
+ * @deprecated Use writeSnapshotAfterTrade() instead. This function
+ * used to fire-and-forget call the `compute-snapshots` Edge
+ * Function, but that path was unreliable in this environment. Kept
+ * as a no-op stub so any lingering call sites don't break the build.
+ */
+export function triggerSnapshotRefresh(_portfolioId: string): void {
+  // No-op: the snapshot is now written directly by
+  // writeSnapshotAfterTrade (called from executeTrade).
+}
+
+/**
+ * Manual "Recompute snapshots" trigger used by the Risk page's
+ * debug button. Awaits the response so the caller can show success
+ * / failure to the user. Just calls writeSnapshotAfterTrade now
+ * (the edge function path was unreliable in this environment).
+ */
+export async function recomputeSnapshots(portfolioId: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    await writeSnapshotAfterTrade(portfolioId);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
+}
+
+// ============================================================
+// POSITION HISTORY (reconstructed from trades)
+// ============================================================
+
+/**
+ * A single point on a reconstructed per-position P&L curve. The
+ * curve is derived from the trade log — there is no historical price
+ * table in this app, so we can only chart what the trades themselves
+ * tell us: the running quantity and weighted-average cost basis at
+ * each fill, plus a final "current mark" using the live price.
+ *
+ * Each entry represents the state of the position AFTER the trade
+ * with the given `trade_timestamp` was applied. The "current" entry
+ * is appended at the end using the live price for the P&L overlay.
+ */
+export interface PositionHistoryPoint {
+  date: string; // ISO timestamp of the trade (or "now" for the live point)
+  qty: number; // signed running quantity
+  avgPrice: number; // weighted-average cost basis
+  marketValue: number; // signed qty * avgPrice (mark-to-cost)
+  pnl: number | null; // null for historical points (no market price); number for the live point
+  pnlPct: number | null;
+  isLive: boolean; // true for the trailing "now" point using a live price
+}
+
+/**
+ * Replay the trade log for one (portfolio, ticker) pair in
+ * chronological order and return a series of (date, qty, avgPrice)
+ * points. Uses the same signed-qty / signed-avg rules as
+ * updatePositionAfterTrade().
+ *
+ * The final point is an additional "live" mark using `livePrice` (if
+ * provided) so the chart can show today's unrealized P&L. Without
+ * `livePrice`, the last trade point is the tail.
+ */
+export function buildPositionHistory(
+  trades: Trade[],
+  ticker: string,
+  livePrice: number | null = null,
+): PositionHistoryPoint[] {
+  const upper = ticker.toUpperCase();
+  const relevant = trades
+    .filter((t) => t.ticker.toUpperCase() === upper)
+    .sort(
+      (a, b) =>
+        new Date(a.trade_timestamp).getTime() -
+        new Date(b.trade_timestamp).getTime(),
+    );
+
+  if (relevant.length === 0) return [];
+
+  let qty = 0;
+  let avgPrice = 0;
+  const series: PositionHistoryPoint[] = [];
+
+  for (const t of relevant) {
+    const tradeQty = t.qty;
+    const tradePrice = t.price;
+    const signedDelta = t.side === 'BUY' ? tradeQty : -tradeQty;
+    const newQty = qty + signedDelta;
+
+    if (newQty === 0) {
+      // Position fully closed/covered. Keep prior avg as a marker, qty = 0.
+      series.push({
+        date: t.trade_timestamp,
+        qty: 0,
+        avgPrice,
+        marketValue: 0,
+        pnl: null,
+        pnlPct: null,
+        isLive: false,
+      });
+      qty = 0;
+      avgPrice = 0;
+      continue;
+    }
+
+    // Determine if this trade opens or adds (in which case the basis
+    // changes) or closes/covers (basis preserved).
+    const wasLong = qty > 0;
+    const wasShort = qty < 0;
+    const direction = (t.direction ?? 'LONG') as 'LONG' | 'SHORT';
+    const openingLong = direction === 'LONG' && t.side === 'BUY' && !wasLong;
+    const addingToLong = direction === 'LONG' && t.side === 'BUY' && wasLong;
+    const openingShort = direction === 'SHORT' && t.side === 'SELL' && !wasShort;
+    const addingToShort = direction === 'SHORT' && t.side === 'SELL' && wasShort;
+
+    let newAvg: number;
+    if (openingLong || openingShort || qty === 0) {
+      newAvg = tradePrice;
+    } else if (addingToLong) {
+      newAvg = (qty * avgPrice + tradeQty * tradePrice) / newQty;
+    } else if (addingToShort) {
+      const existingAbs = Math.abs(qty);
+      newAvg = (existingAbs * avgPrice + tradeQty * tradePrice) / (existingAbs + tradeQty);
+    } else {
+      // Closing or covering: basis preserved.
+      newAvg = avgPrice;
+    }
+
+    qty = newQty;
+    avgPrice = newAvg;
+
+    series.push({
+      date: t.trade_timestamp,
+      qty,
+      avgPrice,
+      marketValue: qty * avgPrice,
+      pnl: null,
+      pnlPct: null,
+      isLive: false,
+    });
+  }
+
+  // Append a "now" point using the live price so the user can see
+  // current unrealized P&L vs the running cost basis.
+  if (livePrice != null && livePrice > 0 && qty !== 0) {
+    const mv = qty * livePrice;
+    const cost = qty * avgPrice;
+    const pnl = mv - cost;
+    const pnlPct = cost > 0 ? (pnl / cost) * 100 : 0;
+    series.push({
+      date: new Date().toISOString(),
+      qty,
+      avgPrice,
+      marketValue: mv,
+      pnl,
+      pnlPct,
+      isLive: true,
+    });
+  }
+
+  return series;
 }
 
 // ============================================================

@@ -27,6 +27,27 @@ function getAdmin(): SupabaseClient {
 }
 
 /**
+ * Check the request's Authorization header against the INTERNAL_API_KEY
+ * shared secret. Returns true if the header is a Bearer token that
+ * exactly matches the configured INTERNAL_API_KEY. Use this for
+ * service-to-service calls (e.g. compute-snapshots accepting a fire-
+ * and-forget from the frontend's `triggerSnapshotRefresh`).
+ *
+ * This is a low-privilege credential: a leak only identifies the
+ * caller as "another edge function". It does NOT bypass RLS — the
+ * service-role key (SERVICE_KEY) is what bypasses RLS, and it lives
+ * inside the admin client and never appears in any HTTP header.
+ */
+export function checkInternalApiKey(req: Request): boolean {
+  const expected = Deno.env.get('INTERNAL_API_KEY') ?? '';
+  if (!expected) return false;
+  const auth = req.headers.get('Authorization');
+  if (!auth?.startsWith('Bearer ')) return false;
+  const token = auth.slice(7);
+  return token === expected;
+}
+
+/**
  * Extract and verify the user from the Authorization header.
  * Returns null if the header is missing, malformed, or the JWT is invalid.
  */

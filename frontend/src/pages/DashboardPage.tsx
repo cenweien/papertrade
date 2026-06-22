@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { Plus, Trash2, Copy, RotateCcw } from 'lucide-react';
 import {
-  getPortfolios,
+  ensureDefaultPortfolio,
   createPortfolio,
   archivePortfolio,
   clonePortfolio,
@@ -22,13 +22,13 @@ export function DashboardPage() {
   // Form state
   const [newName, setNewName] = useState('');
   const [newDescription, setNewDescription] = useState('');
-  const [newCapital, setNewCapital] = useState('100000');
+  const [newCapital, setNewCapital] = useState('100000000');
   const [creating, setCreating] = useState(false);
 
   const load = async () => {
     setLoading(true);
     try {
-      const data = await getPortfolios();
+      const data = await ensureDefaultPortfolio();
       setPortfolios(data);
 
       // Get position count for each portfolio
@@ -61,11 +61,11 @@ export function DashboardPage() {
       await createPortfolio({
         name: newName.trim(),
         description: newDescription.trim() || undefined,
-        initial_capital: parseFloat(newCapital) || 100000,
+        initial_capital: parseFloat(newCapital) || 100000000,
       });
       setNewName('');
       setNewDescription('');
-      setNewCapital('100000');
+      setNewCapital('100000000');
       setShowCreate(false);
       setSearchParams({});
       await load();

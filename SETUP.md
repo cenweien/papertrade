@@ -312,3 +312,60 @@ When the firm is ready to make this "production-grade":
 4. **Set up NSSM** for crash recovery on the relay
 
 The current setup is fine for a paper-trading demo. Production needs the above. See `BLOOMBERG_MIGRATION_PLAN.md` for the full design.
+
+---
+
+## Market-derived Sharpe / VaR (the new pipeline)
+
+The Risk page's Sharpe / VaR / CVaR / Sortino now come from a **reconstructed market return series**, not from the portfolio's own daily snapshots. This means the metrics are meaningful from day 1 of holding — before any `daily_snapshots` rows exist.
+
+### Data flow
+
+```
+frontend (Risk page / PortfolioDetail)
+   ↓ getHistorySeriesLastDays([tickers], 365)
+Supabase edge function: market-data/historical-series
+   ↓ 1. read cache   2. on miss, call relay   3. upsert cache
+bloomberg-service Python relay: /history-series
+   ↓ bdh(tickers, [PX_LAST], start, end)
+Bloomberg B-PIPE
+```
+
+### Pieces added
+
+| File | Purpose |
+|---|---|
+| `supabase/migrations/009_instrument_price_history.sql` | New cache table (ticker, trade_date, close) + indexes + RLS |
+| `supabase/functions/market-data/index.ts` | New `/historical-series` route — reads cache, backfills gaps |
+| `bloomberg-service/app.py` | New `/history-series` endpoint — multi-ticker bdh wrapper |
+| `bloomberg-service/scheduler.py` | New `backfill_history()` tick (default 1h) — keeps the cache warm for tickers_in_use() |
+| `frontend/src/services/marketHistory.ts` | Frontend `getHistorySeries()` / `getHistorySeriesLastDays()` |
+| `frontend/src/services/riskMetrics.ts` | New `buildMarketPortfolioReturns()`; Sharpe/VaR/CVaR/Sortino prefer the market-derived series (≥20 obs) and fall back to snapshots |
+| `frontend/src/pages/RiskPage.tsx`, `PortfolioDetailPage.tsx` | Fetch the new series and pass it through |
+
+### Important semantics
+
+- **Path-dependent stats stay snapshot-driven**: max drawdown, current drawdown, days in drawdown, peak equity, recovery days, worst day. Those describe *this portfolio's* realised path and have no meaning when reconstructed from market data.
+- **Distribution stats go market-derived**: Sharpe, Sortino, historical VaR 95%, CVaR 95%. Those describe the *risk of the current position mix* over the lookback window.
+- The market-derived series assumes the user has held the current mix for the whole window. This is a standard simplification; the alternative (a time-varying mix) is impossible to estimate without daily trade-replay across years of history.
+- Failure mode: if `historical-series` errors out, `riskMetrics` returns `null` for those metrics — the page renders the same "N/A" states as before, not a crash.
+- Drawdown chart, equity chart, position L/S chart and the daily-returns histogram continue to use `daily_snapshots` (the realised path).
+- Tunables: `HISTORY_INTERVAL` (default 1h), `HISTORY_LOOKBACK_DAYS` (default 365), `HISTORY_TABLE` (default `instrument_price_history`) — all env vars on the scheduler.
+
+### Deploying the migration
+
+Three new migrations need to be applied once before the new code paths are usable:
+
+| Migration | Purpose |
+|---|---|
+| `supabase/migrations/008_snapshot_update_policy.sql` | UPDATE RLS policy on `daily_snapshots` (made idempotent; may have been applied previously via SQL Editor) |
+| `supabase/migrations/010_snapshot_delete_policy.sql` | DELETE RLS policy on `daily_snapshots` (new — adds missing DELETE grant) |
+| `supabase/migrations/009_instrument_price_history.sql` | New `instrument_price_history` cache table + indexes + RLS |
+
+```powershell
+supabase db push
+```
+
+If any fail with `42710 policy already exists` or `42P07 relation already exists`, the migration body is already on the remote — run `supabase migration repair --status applied <version>` to sync the CLI tracking table, then re-push.
+
+(or apply the files manually via the Supabase SQL Editor if your project doesn't use the CLI migrations workflow.)

@@ -3,7 +3,7 @@ import { ReactNode, useState, useEffect } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { supabase } from '@/lib/supabase';
 import { LayoutDashboard, MessageSquare, BarChart3, Flame, LogOut, Plus, ShieldAlert } from 'lucide-react';
-import { getPortfolios, type Portfolio } from '@/services/db';
+import { ensureDefaultPortfolio, type Portfolio } from '@/services/db';
 
 export function Layout({ children }: { children: ReactNode }) {
   const location = useLocation();
@@ -11,7 +11,7 @@ export function Layout({ children }: { children: ReactNode }) {
   const [portfolios, setPortfolios] = useState<Portfolio[]>([]);
 
   useEffect(() => {
-    getPortfolios().then(setPortfolios).catch(console.error);
+    ensureDefaultPortfolio().then(setPortfolios).catch(console.error);
   }, []);
 
   const handleSignOut = async () => {

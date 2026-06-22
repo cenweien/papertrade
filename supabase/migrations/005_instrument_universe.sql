@@ -10,11 +10,19 @@
 -- deploy recovery), the second `RENAME` would otherwise fail with
 -- `relation "stock_prices" does not exist` and abort the rest of the
 -- migration.
-DO $$ BEGIN
+--
+-- We use a tagged dollar-quote (`$mig005$`) rather than bare `$$`
+-- here. Some SQL splitter tools (and the Supabase CLI's statement
+-- splitter in particular) can get confused by a `DO $$ ... $$;`
+-- block immediately followed by other `$$ ... $$` PL/pgSQL function
+-- bodies further down in the same file — they end up trying to parse
+-- the whole rest of the file as the DO block. Tagged delimiters make
+-- the boundaries unambiguous.
+DO $mig005$ BEGIN
   IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'stock_prices') THEN
     ALTER TABLE stock_prices RENAME TO instrument_prices;
   END IF;
-END $$;
+END $mig005$;
 
 ALTER TABLE instrument_prices
     ADD COLUMN IF NOT EXISTS asset_class TEXT NOT NULL DEFAULT 'EQUITY'

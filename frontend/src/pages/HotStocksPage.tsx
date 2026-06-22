@@ -10,6 +10,7 @@ import { useState } from 'react';
 import { Activity, TrendingUp, TrendingDown, Flame, RefreshCw } from 'lucide-react';
 import {
   useLivePrices,
+  refreshQuote,
   type StockQuote,
 } from '@/services/marketData';
 
@@ -74,19 +75,64 @@ function StockCard({
   stock,
   quote,
   loading,
+  onRetry,
 }: {
   stock: HotStock;
   quote?: StockQuote;
   loading: boolean;
+  onRetry: (ticker: string) => void;
 }) {
-  // No data yet — render a skeleton
+  // No data yet — render a skeleton, but only on the very first load.
+  // After load completes, a missing quote means the relay returned
+  // no data (404, not_found, or upstream outage). In that case show
+  // an explicit error state with a retry button instead of an
+  // eternal skeleton.
   if (!quote) {
+    if (loading) {
+      return (
+        <div className="card animate-pulse p-6">
+          <div className="h-6 w-20 rounded bg-slate-200 mb-2" />
+          <div className="h-4 w-32 rounded bg-slate-100 mb-6" />
+          <div className="h-10 w-40 rounded bg-slate-200 mb-4" />
+          <div className="h-6 w-28 rounded bg-slate-100" />
+        </div>
+      );
+    }
     return (
-      <div className="card animate-pulse p-6">
-        <div className="h-6 w-20 rounded bg-slate-200 mb-2" />
-        <div className="h-4 w-32 rounded bg-slate-100 mb-6" />
-        <div className="h-10 w-40 rounded bg-slate-200 mb-4" />
-        <div className="h-6 w-28 rounded bg-slate-100" />
+      <div className="card p-6">
+        <div className="flex items-start justify-between mb-2">
+          <div>
+            <div className="flex items-center gap-2">
+              <h2 className="text-3xl font-bold tracking-tight text-slate-900">
+                {stock.ticker}
+              </h2>
+              <span
+                className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${
+                  ASSET_CLASS_BADGE[stock.asset_class].cls
+                }`}
+              >
+                {ASSET_CLASS_BADGE[stock.asset_class].label}
+              </span>
+            </div>
+            <p className="text-sm text-slate-500">{stock.name}</p>
+            <p className="text-xs text-slate-400">{stock.sector}</p>
+          </div>
+        </div>
+        <div className="my-4">
+          <div className="text-sm text-slate-500">No data available</div>
+          <div className="mt-1 text-xs text-slate-400">
+            Bloomberg returned no data for this ticker. It may be
+            delisted, halted, or not covered by the firm&apos;s B-PIPE
+            subscription.
+          </div>
+        </div>
+        <button
+          onClick={() => onRetry(stock.ticker)}
+          className="mt-2 inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-600 hover:bg-slate-50"
+        >
+          <RefreshCw className="h-3 w-3" />
+          Retry
+        </button>
       </div>
     );
   }
@@ -169,6 +215,17 @@ export function HotStocksPage() {
   const tickers = visible.map((s) => s.ticker);
   const { quotes, loading, refreshing, lastUpdated, refresh } = useLivePrices(tickers, 60_000);
 
+  // Per-ticker retry: hit the force-refresh endpoint, then re-run the
+  // batch refresh so the card swaps back to the live state.
+  const handleRetry = async (ticker: string) => {
+    try {
+      await refreshQuote(ticker);
+    } catch (err) {
+      console.error(`Manual refresh failed for ${ticker}:`, err);
+    }
+    refresh();
+  };
+
   return (
     <div className="p-8 max-w-7xl mx-auto">
       {/* Header */}
@@ -235,6 +292,7 @@ export function HotStocksPage() {
               stock={stock}
               quote={quotes[stock.ticker]}
               loading={loading}
+              onRetry={handleRetry}
             />
           ))}
         </div>
