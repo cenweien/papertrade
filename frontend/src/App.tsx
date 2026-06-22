@@ -10,6 +10,7 @@ import { PortfolioDetailPage } from '@/pages/PortfolioDetailPage';
 import { AIChatPage } from '@/pages/AIChatPage';
 import { ComparisonPage } from '@/pages/ComparisonPage';
 import { HotStocksPage } from '@/pages/HotStocksPage';
+import { RiskPage } from '@/pages/RiskPage';
 
 function App() {
   const [session, setSession] = useState<Session | null>(null);
@@ -55,6 +56,8 @@ function App() {
         <Route path="/portfolio/:id" element={<PortfolioDetailPage />} />
         <Route path="/ai" element={<AIChatPage />} />
         <Route path="/comparison" element={<ComparisonPage />} />
+        <Route path="/risk" element={<RiskPage />} />
+        <Route path="/risk/:portfolioId" element={<RiskPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </Layout>

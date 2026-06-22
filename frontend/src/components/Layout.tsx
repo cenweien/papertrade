@@ -2,7 +2,7 @@
 import { ReactNode, useState, useEffect } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { supabase } from '@/lib/supabase';
-import { LayoutDashboard, MessageSquare, BarChart3, Flame, LogOut, Plus } from 'lucide-react';
+import { LayoutDashboard, MessageSquare, BarChart3, Flame, LogOut, Plus, ShieldAlert } from 'lucide-react';
 import { getPortfolios, type Portfolio } from '@/services/db';
 
 export function Layout({ children }: { children: ReactNode }) {
@@ -24,6 +24,7 @@ export function Layout({ children }: { children: ReactNode }) {
     { path: '/hot', icon: Flame, label: 'Hot Stocks' },
     { path: '/ai', icon: MessageSquare, label: 'AI Chat' },
     { path: '/comparison', icon: BarChart3, label: 'Comparison' },
+    { path: '/risk', icon: ShieldAlert, label: 'Risk Analytics' },
   ];
 
   return (
