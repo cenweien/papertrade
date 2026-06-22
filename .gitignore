@@ -68,3 +68,18 @@ bloomberg-service/.venv/
 bloomberg-service/.env
 bloomberg-service/**/__pycache__/
 bloomberg-service/**/*.pyc
+
+# ----------------------------------------------------------------------------
+# Local tooling caches
+# ----------------------------------------------------------------------------
+# Chroma vector DB cache (used by indexing/ scripts)
+.chroma/
+# Supabase CLI temp / state files
+supabase/.temp/
+supabase/supabase/
+# Empty root package files (this repo's frontend has its own package.json)
+package.json
+package-lock.json
+pnpm-lock.yaml
+bun.lock
+yarn.lock
