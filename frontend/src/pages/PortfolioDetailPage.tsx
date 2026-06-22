@@ -12,14 +12,18 @@ import {
   type Portfolio,
   type Position,
   type Trade,
+  type DailySnapshot,
 } from '@/services/db';
 import { useLivePrices, refreshQuote, getQuote } from '@/services/marketData';
+import { PerformanceCharts, RangeTabs, type TimeRange } from '@/components/PerformanceCharts';
 
 export function PortfolioDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
   const [positions, setPositions] = useState<Position[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
+  const [snapshots, setSnapshots] = useState<DailySnapshot[]>([]);
+  const [chartRange, setChartRange] = useState<TimeRange>('DAILY');
   const [loading, setLoading] = useState(true);
 
   // Trade form state
@@ -63,9 +67,14 @@ export function PortfolioDetailPage() {
         return;
       }
       setPortfolio(p);
-      const [pos, trds] = await Promise.all([getPositions(id), getTrades(id, 50)]);
+      const [pos, trds, snaps] = await Promise.all([
+        getPositions(id),
+        getTrades(id, 50),
+        getSnapshots(id, 365),
+      ]);
       setPositions(pos);
       setTrades(trds);
+      setSnapshots(snaps);
     } catch (err) {
       console.error('Failed to load portfolio:', err);
     } finally {
@@ -252,6 +261,19 @@ export function PortfolioDetailPage() {
             ${totalExposure.toLocaleString(undefined, { maximumFractionDigits: 2 })}
           </div>
         </div>
+      </div>
+
+      {/* Performance charts */}
+      <div className="mb-6">
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-slate-900">Performance</h2>
+          <RangeTabs value={chartRange} onChange={setChartRange} />
+        </div>
+        <PerformanceCharts
+          snapshots={snapshots}
+          initialCapital={portfolio.initial_capital}
+          range={chartRange}
+        />
       </div>
 
       {showTradeForm && (
