@@ -388,6 +388,14 @@ const COMPANY_TO_TICKER: Record<string, string> = {
   'general motors': 'GM',
   toyota: 'TM',
   honda: 'HMC',
+  // Common brand / colloquial names the regex misses and the LLM
+  // otherwise echoes verbatim (e.g. "buy sandisk" -> SANDISK instead
+  // of the real NASDAQ ticker SNDK; "buy lily" -> LILY instead of
+  // LLY). Longer phrases precede their substrings because keys are
+  // sorted by length desc before lookup.
+  sandisk: 'SNDK',
+  'eli lilly': 'LLY',
+  lily: 'LLY',
 };
 
 // =====================================================================
@@ -1985,6 +1993,17 @@ serve(async (req: Request) => {
           })
           .filter((l: any): l is ParsedLeg => l !== null);
         const primaryLeg = sanitizedLegs[0];
+        // Same historical-price guard as the live path: if any cached
+        // leg has a past trade_date but no resolved/limit price, force
+        // needs_confirmation so the UI doesn't let the user Execute.
+        const todayForGuard = new Date().toISOString().slice(0, 10);
+        const cachedAnyHistMissingPrice = sanitizedLegs.some(
+          (l) =>
+            l.trade_date != null &&
+            l.trade_date < todayForGuard &&
+            l.resolved_price == null &&
+            l.limit_price == null,
+        );
         return jsonResponse({
           success: true,
           data: {
@@ -2006,6 +2025,7 @@ serve(async (req: Request) => {
             // needs_confirmation. Force it on so the user is prompted.
             needs_confirmation:
               Boolean(cached.needs_confirmation) ||
+              cachedAnyHistMissingPrice ||
               (sanitizedLegs.length === 0),
             market_price: displayPrice,
             market_context: marketContext,
@@ -2242,9 +2262,13 @@ serve(async (req: Request) => {
             };
             reason = null;
           } else {
-            const live = await ensureFreshQuote(leg.ticker, userAuth);
-            quote = live.quote;
-            if (!live.quote) reason = `historical: ${live.unavailable_reason}`;
+            // No historical price — do NOT silently fall back to the
+            // live quote. That would record today's price against a
+            // past `executed_at`, which is a backdating bug. Surface
+            // the reason and leave `quote` null so the user has to
+            // enter a limit price to execute.
+            reason = `no historical close for ${leg.ticker} on ${leg.trade_date}; ` +
+              `enter a limit price or pick a different date`;
           }
         } else {
           const live = await ensureFreshQuote(leg.ticker, userAuth);
@@ -2303,10 +2327,23 @@ serve(async (req: Request) => {
       const isHistorical = legResults.some(
         (l) => l.trade_date != null && l.trade_date < todayIso,
       );
+      // Historical leg without a resolved close: force
+      // needs_confirmation so the UI prompts the user to enter a
+      // limit price (or pick a different date) before Execute is
+      // allowed. Without this, the user could click straight
+      // through and we'd record today's price against a past date.
+      const anyHistoricalMissingPrice = legResults.some(
+        (l) =>
+          l.trade_date != null &&
+          l.trade_date < todayIso &&
+          l.resolved_price == null &&
+          l.limit_price == null,
+      );
       const finalParsed: ParsedCommand = {
         ...parsed,
         legs: legResults,
         is_historical: isHistorical,
+        needs_confirmation: parsed.needs_confirmation || anyHistoricalMissingPrice,
         // Legacy back-compat fields (mirror primary leg):
         action: primary.action,
         direction: primary.direction,
