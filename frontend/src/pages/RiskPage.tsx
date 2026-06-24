@@ -34,6 +34,7 @@ import {
   getTrades,
   getSnapshots,
   recomputeSnapshots,
+  isTradingDay,
   type Portfolio,
   type Position,
   type Trade,
@@ -121,7 +122,7 @@ export function RiskPage() {
 
   // ---- Load the selected portfolio's data ----
   const reloadData = async (id: string) => {
-    const [portfolio, positions, trades, snapshots] = await Promise.all([
+    const [portfolio, positions, trades, allSnapshots] = await Promise.all([
       getPortfolio(id),
       getPositions(id),
       getTrades(id, 500),
@@ -132,6 +133,10 @@ export function RiskPage() {
       setData(null);
       return;
     }
+    // Filter out weekend snapshot rows. The backfill writes a row
+    // for every calendar day; weekends have no real price action
+    // and inflate the Sharpe window with zero-variance noise.
+    const snapshots = allSnapshots.filter((s) => isTradingDay(s.snapshot_date));
     // Market-derived history series. Fetched AFTER the core data so
     // the page can render positions/trades immediately even if the
     // Bloomberg backfill is slow. A failure here is non-fatal —

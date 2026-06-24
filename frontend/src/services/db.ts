@@ -1,5 +1,6 @@
 // Database service - direct Supabase calls
 import { supabase } from '@/lib/supabase';
+import { getHistorySeries } from '@/services/marketHistory';
 import type { Database } from '@/types/database.types';
 
 // These types match the SQL schema exactly
@@ -407,8 +408,15 @@ export async function executeTrade(input: {
   //     compute-snapshots edge function) because the same auth chain
   //     already authorized the trade + position + cash writes above,
   //     so the snapshot write can use the same session with no
-  //     extra cold start. ----
-  await writeSnapshotAfterTrade(input.portfolio_id);
+  //     extra cold start.
+  //
+  //     Pass the trade's `executed_at` date (not `today`) so back-
+  //     dated trades — e.g. the AI chat's "buy AAPL a year ago" —
+  //     stamp the snapshot for the historical date. Then backfill
+  //     every calendar day from that date through today so the chart
+  //     has a continuous series instead of two isolated points. ----
+  const snapshotDate = (input.executed_at ?? new Date().toISOString()).slice(0, 10);
+  await writeSnapshotAfterTrade(input.portfolio_id, snapshotDate);
 
   return trade;
 }
@@ -575,6 +583,72 @@ export async function updatePositionPrice(
     .eq('id', id);
 }
 
+/**
+ * "Since the buy" baseline equity for a portfolio.
+ *
+ * P&L denominators used to be `portfolio.initial_capital` (papertrading
+ * inception), which makes a single fresh trade show a meaningless
+ * fraction-of-$100M return. The user-visible contract is "since the
+ * first buy", so we anchor on the equity of the earliest trade date.
+ *
+ * Resolution order:
+ *   1. Earliest snapshot's equity (written by writeSnapshotAfterTrade's
+ *      backfill — covers the trade date itself).
+ *   2. Replay trades up to and including the earliest trade date using
+ *      fill prices, if no snapshot exists yet (defensive: covers the
+ *      window between trade and next snapshot write).
+ *   3. `initial_capital` as a last resort (no trades → no return).
+ */
+export function computeBuyBaselineEquity(
+  initialCapital: number,
+  trades: Array<{ ticker: string; side: 'BUY' | 'SELL'; qty: number; price: number; executed_at: string }>,
+  snapshots: Array<{ snapshot_date: string; equity: number }>,
+): number {
+  if (trades.length === 0) return initialCapital;
+  const earliestDate = trades
+    .map((t) => t.executed_at.slice(0, 10))
+    .sort()[0];
+  const snap = snapshots.find((s) => s.snapshot_date === earliestDate);
+  if (snap && Number.isFinite(snap.equity) && snap.equity > 0) {
+    return snap.equity;
+  }
+  let cash = initialCapital;
+  const positions = new Map<string, { qty: number; avg_price: number }>();
+  const sorted = [...trades].sort(
+    (a, b) => a.executed_at.localeCompare(b.executed_at),
+  );
+  for (const t of sorted) {
+    const day = t.executed_at.slice(0, 10);
+    if (day > earliestDate) break;
+    cash += t.side === 'BUY' ? -t.qty * t.price : t.qty * t.price;
+    const tk = t.ticker.toUpperCase();
+    const existing = positions.get(tk);
+    const signedDelta = t.side === 'BUY' ? t.qty : -t.qty;
+    const newQty = (existing?.qty ?? 0) + signedDelta;
+    if (newQty === 0) {
+      positions.delete(tk);
+      continue;
+    }
+    let newAvg: number;
+    if (existing) {
+      const wasLong = existing.qty > 0;
+      const addingToLong = t.side === 'BUY' && wasLong;
+      if (addingToLong) {
+        newAvg =
+          (existing.qty * existing.avg_price + t.qty * t.price) / newQty;
+      } else {
+        newAvg = t.price;
+      }
+    } else {
+      newAvg = t.price;
+    }
+    positions.set(tk, { qty: newQty, avg_price: newAvg });
+  }
+  let mv = 0;
+  for (const pos of positions.values()) mv += pos.qty * pos.avg_price;
+  return cash + mv;
+}
+
 // ============================================================
 // DAILY SNAPSHOTS
 // ============================================================
@@ -594,6 +668,17 @@ export async function getSnapshots(
   return data || [];
 }
 
+/**
+ * True for Mon-Fri (UTC). Used to filter weekend rows out of charts
+ * and risk metrics — the backfill writes a row for every calendar day
+ * so the raw series has flat weekend points that distort drawdown /
+ * Sharpe.
+ */
+export function isTradingDay(isoDate: string): boolean {
+  const dow = new Date(`${isoDate}T00:00:00Z`).getUTCDay();
+  return dow !== 0 && dow !== 6;
+}
+
 export async function createSnapshot(input: {
   portfolio_id: string;
   snapshot_date: string;
@@ -609,9 +694,9 @@ export async function createSnapshot(input: {
 
 /**
  * Persist a `daily_snapshots` row for the portfolio right after a
- * trade executes. Computes today's portfolio equity from the just-
- * written positions table, marks each position to the live price
- * from the `instrument_prices` cache (the same one the Python
+ * trade executes. Computes the trade-date portfolio equity from the
+ * just-written positions table, marks each position to the live
+ * price from the `instrument_prices` cache (the same one the Python
  * scheduler keeps fresh from Bloomberg), and writes the row directly
  * via the Supabase client — bypassing the `compute-snapshots` Edge
  * Function entirely.
@@ -630,17 +715,33 @@ export async function createSnapshot(input: {
  *     live price the position row would be marked to anywhere else
  *     in the app).
  *
+ * For back-dated trades (e.g. the AI chat's "buy AAPL a year ago"),
+ * `snapshotDate` is the trade's `executed_at` date — NOT today. The
+ * function then replays the entire trade log from the earliest
+ * affected trade through today and writes one snapshot per calendar
+ * day, so the chart has a continuous series instead of two isolated
+ * points. Today uses live prices; historical days use the trade
+ * fill price as the mark (instrument_price_history is populated by
+ * the edge function + Python scheduler and may be empty for tickers
+ * the user hasn't backfilled).
+ *
  * Idempotent: re-running for the same (portfolio_id, snapshot_date)
- * upserts in place. Trade execution is the trigger; a Risk-page
- * "Recompute snapshots" click can also fire this for backfill.
+ * deletes + re-inserts the prior row.
  *
  * Errors are swallowed — the user already saw the trade succeed and
  * the trade UX must not wait on this write.
  */
-export async function writeSnapshotAfterTrade(portfolioId: string): Promise<void> {
+export async function writeSnapshotAfterTrade(
+  portfolioId: string,
+  snapshotDate?: string,
+): Promise<void> {
   try {
-    // 1. Fetch the just-updated positions and portfolio.
-    const [{ data: portfolio }, { data: positions }] = await Promise.all([
+    const today = new Date().toISOString().slice(0, 10);
+    const tradeDate = (snapshotDate ?? today).slice(0, 10);
+
+    // 1. Fetch the just-updated positions, portfolio, and the full
+    // trade log (sorted oldest-first) for replay.
+    const [{ data: portfolio }, { data: positions }, { data: trades }] = await Promise.all([
       supabase
         .from('portfolios')
         .select('current_capital, initial_capital')
@@ -650,16 +751,29 @@ export async function writeSnapshotAfterTrade(portfolioId: string): Promise<void
         .from('positions')
         .select('ticker, qty, avg_price, sector')
         .eq('portfolio_id', portfolioId),
+      supabase
+        .from('trades')
+        .select('ticker, side, direction, qty, price, executed_at')
+        .eq('portfolio_id', portfolioId)
+        .order('executed_at', { ascending: true }),
     ]);
     if (!portfolio) return;
     const posList = positions ?? [];
+    const tradeList = (trades ?? []) as Array<{
+      ticker: string;
+      side: 'BUY' | 'SELL';
+      direction: 'LONG' | 'SHORT' | null;
+      qty: number;
+      price: number;
+      executed_at: string;
+    }>;
 
     // 2. Fetch the live prices for every position's ticker (in
     // parallel). Fall back to avg_price for any ticker without a
-    // cached price so the snapshot can still be written (degenerate
-    // mark, but not blocking).
+    // cached price so today's snapshot can still be written
+    // (degenerate mark, but not blocking).
     const tickers = Array.from(new Set(posList.map((p) => p.ticker.toUpperCase())));
-    const priceMap = new Map<string, number>();
+    const livePriceMap = new Map<string, number>();
     if (tickers.length > 0) {
       const { data: priceRows } = await supabase
         .from('instrument_prices')
@@ -667,121 +781,500 @@ export async function writeSnapshotAfterTrade(portfolioId: string): Promise<void
         .in('ticker', tickers);
       for (const r of priceRows ?? []) {
         if (r.current_price != null) {
-          priceMap.set(r.ticker.toUpperCase(), Number(r.current_price));
+          livePriceMap.set(r.ticker.toUpperCase(), Number(r.current_price));
         }
       }
     }
 
-    // 3. Compute per-ticker MV and the per-position "ratio" the
-    // user calls the holding-period return. LONG:
-    //   return_pct = (price - avgPrice) / avgPrice * 100
-    // SHORT (qty < 0):
-    //   return_pct = (avgPrice - price) / avgPrice * 100
-    // (a short that dropped in price has a positive return — the
-    // price-relative formula mirrors the P&L sign convention.)
-    const positionJsonb: Record<string, {
-      qty: number;
-      mv: number;
-      sector: string | null;
-      avg_price: number;
-      price: number;
-      return_pct: number | null;
-    }> = {};
-    let longValue = 0;
-    let shortValue = 0;
-    const sectorMap: Record<string, { long: number; short: number; net: number }> = {};
-    for (const p of posList) {
-      const tk = p.ticker.toUpperCase();
-      const mark = priceMap.get(tk) ?? Number(p.avg_price) ?? 0;
-      const mv = Number(p.qty) * mark;
-      let returnPct: number | null = null;
-      const avg = Number(p.avg_price);
-      if (avg > 0 && mark > 0) {
-        const priceReturn = (mark - avg) / avg;
-        returnPct = Number(p.qty) >= 0 ? priceReturn * 100 : -priceReturn * 100;
+    // 3. Compute the "today" snapshot (live mark, full L/S columns).
+    // This is what PerformanceCharts reads for the most recent point
+    // and what the L/S strip / HHI footer read.
+    const todaySnapshot = computeLiveSnapshot(
+      posList,
+      livePriceMap,
+      Number(portfolio.current_capital) || 0,
+    );
+
+    // 4. Write today's snapshot first (delete + insert for idempotency
+    // under the existing RLS grants — no UPDATE policy exists).
+    // daily_return is null here; patched after backfill so the prior
+    // row is yesterday (not the trade date).
+    await upsertSnapshotRow(portfolioId, today, {
+      equity: todaySnapshot.equity,
+      exposure: todaySnapshot.grossExposure,
+      cash: todaySnapshot.cash,
+      daily_return: null,
+      long_value: todaySnapshot.longValue,
+      short_value: todaySnapshot.shortValue,
+      net_value: todaySnapshot.netValue,
+      long_pct: todaySnapshot.longPct,
+      short_pct: todaySnapshot.shortPct,
+      net_pct: todaySnapshot.netPct,
+      gross_pct: todaySnapshot.grossPct,
+      sector_jsonb: todaySnapshot.sectorMap,
+      position_jsonb: todaySnapshot.positionJsonb,
+    });
+
+    // 5. If the trade is back-dated, prime the instrument_price_history
+    // cache with a Bloomberg historical-series fetch covering every
+    // held ticker from the trade date through today. Without this,
+    // the backfill below would have to mark most days at the trade
+    // fill price and then jump to the live mark on the last day,
+    // producing a single-day daily_return spike (e.g. 750% for a
+    // year-old all-in trade). getHistorySeries performs the backfill
+    // server-side via the market-data edge function; failures are
+    // non-fatal (the backfill then falls back to carry-forward marks).
+    if (tradeDate < today && tradeList.length > 0) {
+      try {
+        const backfillTickers = Array.from(
+          new Set(tradeList.map((t) => t.ticker.toUpperCase())),
+        );
+        await getHistorySeries(backfillTickers, tradeDate, today);
+      } catch (err) {
+        console.warn(
+          'historical-series priming failed; backfill will fall back to carry-forward marks:',
+          err,
+        );
       }
-      positionJsonb[tk] = {
-        qty: Number(p.qty),
-        mv,
-        sector: p.sector ?? null,
-        avg_price: avg,
-        price: mark,
-        return_pct: returnPct,
-      };
-      if (mv >= 0) longValue += mv;
-      else shortValue += mv;
-      const sec = p.sector ?? 'Unknown';
-      const entry = sectorMap[sec] ?? { long: 0, short: 0, net: 0 };
-      if (mv >= 0) entry.long += mv;
-      else entry.short += mv;
-      entry.net = entry.long + entry.short;
-      sectorMap[sec] = entry;
-    }
-    const netValue = longValue + shortValue;
-    const grossExposure = longValue + Math.abs(shortValue);
-    const cash = Number(portfolio.current_capital) || 0;
-    const equity = cash + netValue;
-
-    // 4. daily_return vs the prior snapshot for this same portfolio.
-    const today = new Date().toISOString().slice(0, 10);
-    const { data: prevSnap } = await supabase
-      .from('daily_snapshots')
-      .select('equity, snapshot_date')
-      .eq('portfolio_id', portfolioId)
-      .lt('snapshot_date', today)
-      .order('snapshot_date', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    let dailyReturn: number | null = null;
-    if (prevSnap && Number(prevSnap.equity) > 0) {
-      dailyReturn = (equity - Number(prevSnap.equity)) / Number(prevSnap.equity);
+      await backfillHistoricalSnapshots(portfolioId, tradeList, tradeDate, today);
     }
 
-    // 5. Upsert today's snapshot. We do this as a delete-then-insert
-    // rather than a true upsert because the existing RLS policy set
-    // on daily_snapshots only grants SELECT and INSERT — there is
-    // no UPDATE policy (the original schema migration only added
-    // SELECT and INSERT). Re-running this code for the same day
-    // must replace the prior row with the latest mark, so:
-    //   - DELETE any existing row for (portfolio, today) — DELETE
-    //     works under the existing schema's grants.
-    //   - INSERT the fresh row.
-    // This is a small race window (two concurrent trades on the same
-    // day), but that's an edge case for a single-user app.
-    const row = {
-      portfolio_id: portfolioId,
-      snapshot_date: today,
-      equity,
-      exposure: grossExposure,
-      cash,
-      daily_return: dailyReturn,
-      long_value: longValue,
-      short_value: shortValue,
-      net_value: netValue,
-      long_pct: equity > 0 ? (longValue / equity) * 100 : null,
-      short_pct: equity > 0 ? (shortValue / equity) * 100 : null,
-      net_pct: equity > 0 ? (netValue / equity) * 100 : null,
-      gross_pct: equity > 0 ? (grossExposure / equity) * 100 : null,
-      sector_jsonb: sectorMap,
-      position_jsonb: positionJsonb,
-    };
-    // Delete first (idempotent — silently no-ops when no row exists).
-    await supabase
-      .from('daily_snapshots')
-      .delete()
-      .eq('portfolio_id', portfolioId)
-      .eq('snapshot_date', today);
-    // Then insert the fresh row. RLS allows INSERT for the user's
-    // own portfolios.
-    const { error: insErr } = await supabase
-      .from('daily_snapshots')
-      .insert(row);
-    if (insErr) {
-      console.warn('writeSnapshotAfterTrade insert failed (non-fatal):', insErr);
+    // 6. Patch today's daily_return vs the prior snapshot. Done
+    // AFTER backfill so the prior row is yesterday, not the trade
+    // date — otherwise the first day's chart would show the entire
+    // back-dated period as a single "daily" return.
+    const priorDate = await getPriorSnapshotDate(portfolioId, today);
+    if (priorDate) {
+      const priorEquity = await getSnapshotEquity(portfolioId, priorDate);
+      if (priorEquity != null && priorEquity > 0) {
+        await patchDailyReturn(
+          portfolioId,
+          today,
+          (todaySnapshot.equity - priorEquity) / priorEquity,
+        );
+      }
     }
   } catch (err) {
     console.warn('writeSnapshotAfterTrade failed (non-fatal):', err);
   }
+}
+
+// ----- Snapshot helpers -----
+
+interface LiveSnapshot {
+  cash: number;
+  equity: number;
+  longValue: number;
+  shortValue: number;
+  netValue: number;
+  grossExposure: number;
+  longPct: number | null;
+  shortPct: number | null;
+  netPct: number | null;
+  grossPct: number | null;
+  sectorMap: Record<string, { long: number; short: number; net: number }>;
+  positionJsonb: Record<string, unknown>;
+}
+
+/**
+ * Build a full snapshot row from the current positions table + a
+ * mark-price map (live prices from `instrument_prices`, or any other
+ * source). Mirrors the math the original writeSnapshotAfterTrade
+ * used for today's row.
+ */
+function computeLiveSnapshot(
+  posList: Array<{ ticker: string; qty: number; avg_price: number; sector: string | null }>,
+  priceMap: Map<string, number>,
+  cash: number,
+): LiveSnapshot {
+  const positionJsonb: Record<string, unknown> = {};
+  let longValue = 0;
+  let shortValue = 0;
+  const sectorMap: Record<string, { long: number; short: number; net: number }> = {};
+  for (const p of posList) {
+    const tk = p.ticker.toUpperCase();
+    const mark = priceMap.get(tk) ?? Number(p.avg_price) ?? 0;
+    const mv = Number(p.qty) * mark;
+    const avg = Number(p.avg_price);
+    let returnPct: number | null = null;
+    if (avg > 0 && mark > 0) {
+      const priceReturn = (mark - avg) / avg;
+      returnPct = Number(p.qty) >= 0 ? priceReturn * 100 : -priceReturn * 100;
+    }
+    positionJsonb[tk] = {
+      qty: Number(p.qty),
+      mv,
+      sector: p.sector ?? null,
+      avg_price: avg,
+      price: mark,
+      return_pct: returnPct,
+    };
+    if (mv >= 0) longValue += mv;
+    else shortValue += mv;
+    const sec = p.sector ?? 'Unknown';
+    const entry = sectorMap[sec] ?? { long: 0, short: 0, net: 0 };
+    if (mv >= 0) entry.long += mv;
+    else entry.short += mv;
+    entry.net = entry.long + entry.short;
+    sectorMap[sec] = entry;
+  }
+  const netValue = longValue + shortValue;
+  const grossExposure = longValue + Math.abs(shortValue);
+  const equity = cash + netValue;
+  return {
+    cash,
+    equity,
+    longValue,
+    shortValue,
+    netValue,
+    grossExposure,
+    longPct: equity > 0 ? (longValue / equity) * 100 : null,
+    shortPct: equity > 0 ? (shortValue / equity) * 100 : null,
+    netPct: equity > 0 ? (netValue / equity) * 100 : null,
+    grossPct: equity > 0 ? (grossExposure / equity) * 100 : null,
+    sectorMap,
+    positionJsonb,
+  };
+}
+
+/**
+ * Delete + insert a snapshot row. DELETE works under the existing
+ * RLS grants; UPDATE does not.
+ */
+async function upsertSnapshotRow(
+  portfolioId: string,
+  snapshotDate: string,
+  row: Record<string, unknown>,
+): Promise<void> {
+  await supabase
+    .from('daily_snapshots')
+    .delete()
+    .eq('portfolio_id', portfolioId)
+    .eq('snapshot_date', snapshotDate);
+  const { error: insErr } = await supabase
+    .from('daily_snapshots')
+    .insert({ portfolio_id: portfolioId, snapshot_date: snapshotDate, ...row });
+  if (insErr) {
+    console.warn(`snapshot insert failed for ${snapshotDate} (non-fatal):`, insErr);
+  }
+}
+
+/**
+ * Update only the `daily_return` column on an existing snapshot row.
+ * Used to backfill the today-vs-yesterday return after both rows are
+ * known.
+ */
+async function patchDailyReturn(
+  portfolioId: string,
+  snapshotDate: string,
+  dailyReturn: number,
+): Promise<void> {
+  // No UPDATE RLS policy exists, so delete + insert to overwrite.
+  const { data: existing } = await supabase
+    .from('daily_snapshots')
+    .select('*')
+    .eq('portfolio_id', portfolioId)
+    .eq('snapshot_date', snapshotDate)
+    .maybeSingle();
+  if (!existing) return;
+  await supabase
+    .from('daily_snapshots')
+    .delete()
+    .eq('portfolio_id', portfolioId)
+    .eq('snapshot_date', snapshotDate);
+  await supabase.from('daily_snapshots').insert({
+    ...existing,
+    daily_return: dailyReturn,
+  });
+}
+
+async function getPriorSnapshotDate(
+  portfolioId: string,
+  beforeDate: string,
+): Promise<string | null> {
+  const { data } = await supabase
+    .from('daily_snapshots')
+    .select('snapshot_date')
+    .eq('portfolio_id', portfolioId)
+    .lt('snapshot_date', beforeDate)
+    .order('snapshot_date', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  return data?.snapshot_date ?? null;
+}
+
+async function getSnapshotEquity(
+  portfolioId: string,
+  snapshotDate: string,
+): Promise<number | null> {
+  const { data } = await supabase
+    .from('daily_snapshots')
+    .select('equity')
+    .eq('portfolio_id', portfolioId)
+    .eq('snapshot_date', snapshotDate)
+    .maybeSingle();
+  return data ? Number(data.equity) : null;
+}
+
+/**
+ * Fetch a `ticker -> Map<YYYY-MM-DD, close>` view of
+ * `instrument_price_history` for the given tickers over [from..to]
+ * (inclusive). Returns an empty map if the table has no rows for the
+ * window — callers should fall back to fill-price marks in that case.
+ *
+ * `instrument_price_history` is populated by the
+ * `market-data/historical-series` edge function (Bloomberg relay) and
+ * by the bloomberg-service scheduler. The table has a public-read RLS
+ * policy so the anon key can read it without authentication.
+ */
+async function fetchDailyCloseMap(
+  tickers: string[],
+  from: string,
+  to: string,
+): Promise<Map<string, Map<string, number>>> {
+  const cleaned = Array.from(new Set(tickers.map((t) => t.toUpperCase())))
+    .filter(Boolean);
+  if (cleaned.length === 0) return new Map();
+  const { data, error } = await supabase
+    .from('instrument_price_history')
+    .select('ticker, trade_date, close')
+    .in('ticker', cleaned)
+    .gte('trade_date', from)
+    .lte('trade_date', to);
+  if (error || !data) return new Map();
+  const out = new Map<string, Map<string, number>>();
+  for (const row of data) {
+    const tk = String(row.ticker).toUpperCase();
+    let inner = out.get(tk);
+    if (!inner) {
+      inner = new Map();
+      out.set(tk, inner);
+    }
+    inner.set(String(row.trade_date), Number(row.close));
+  }
+  return out;
+}
+
+/**
+ * In-memory trade-log replay for backfill. For each calendar day from
+ * `fromDate` (inclusive) through `toDate` (exclusive — today's row is
+ * written separately with live marks):
+ *   - Cash = initial_capital + sum(cashDelta for trades with
+ *     executed_at date <= day). SELL adds cash, BUY subtracts.
+ *   - Positions = apply all trades with executed_at date <= day, in
+ *     order, using the same rules as updatePositionAfterTrade
+ *     (signed qty + signed-aware avg price).
+ *   - Mark price for (ticker, day) = the close from
+ *     `instrument_price_history` if available for that calendar day;
+ *     otherwise the trade fill price of the most recent trade in or
+ *     before `day` for that ticker; otherwise the position's avg_price.
+ *     Using real close prices is what makes the equity curve drift
+ *     realistically instead of sitting flat at cost basis.
+ *   - equity = cash + sum(qty * mark).
+ *
+ * Each day's snapshot is written with full L/S columns where
+ * computable; long_value/short_value/sector_jsonb/position_jsonb are
+ * left null for historical days (PerformanceCharts and RiskPage don't
+ * read them off historical rows — only the live "today" snapshot is
+ * consumed by the L/S strip / HHI footer).
+ */
+async function backfillHistoricalSnapshots(
+  portfolioId: string,
+  trades: Array<{
+    ticker: string;
+    side: 'BUY' | 'SELL';
+    direction: 'LONG' | 'SHORT' | null;
+    qty: number;
+    price: number;
+    executed_at: string;
+  }>,
+  fromDate: string,
+  toDateExclusive: string,
+): Promise<void> {
+  const { data: portfolio } = await supabase
+    .from('portfolios')
+    .select('initial_capital')
+    .eq('id', portfolioId)
+    .maybeSingle();
+  const initialCapital = Number(portfolio?.initial_capital) || 0;
+
+  // Index trades by their YYYY-MM-DD date for fast day lookup.
+  const tradesByDay = new Map<string, typeof trades>();
+  for (const t of trades) {
+    const day = t.executed_at.slice(0, 10);
+    const list = tradesByDay.get(day) ?? [];
+    list.push(t);
+    tradesByDay.set(day, list);
+  }
+
+  // Best-effort fetch of real daily closes from instrument_price_history.
+  // Failures (table missing, RLS, etc.) are non-fatal — we just fall
+  // back to the existing fill-price mark behaviour, so the curve is
+  // flat at cost basis instead of broken.
+  const heldTickers = Array.from(new Set(trades.map((t) => t.ticker.toUpperCase())));
+  const yesterday = new Date(`${toDateExclusive}T00:00:00Z`);
+  yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+  const yesterdayStr = yesterday.toISOString().slice(0, 10);
+  const closeMap = await fetchDailyCloseMap(heldTickers, fromDate, yesterdayStr);
+
+  // Replay state: cash and positions.
+  let cash = initialCapital;
+  type ReplayPos = { qty: number; avg_price: number };
+  const positions = new Map<string, ReplayPos>();
+
+  // Apply any trades strictly before fromDate first (so the fromDate
+  // row reflects end-of-fromDate state, which includes trades dated
+  // exactly on fromDate).
+  for (const t of trades) {
+    if (t.executed_at.slice(0, 10) < fromDate) {
+      applyTrade(positions, cash, t);
+      cash = applyCash(cash, t);
+    }
+  }
+
+  // Walk every calendar day from fromDate through toDateExclusive.
+  // We step in 1-day increments; up to ~365 iterations for a 1Y
+  // backfill, which is cheap.
+  const cursor = new Date(`${fromDate}T00:00:00Z`);
+  const end = new Date(`${toDateExclusive}T00:00:00Z`);
+  let prevEquity: number | null = null;
+  // Carry-forward mark per ticker. Seed with the trade fill price so
+  // the position starts at cost basis. As real closes arrive in
+  // closeMap we update this; days with no close inherit the previous
+  // mark, keeping the equity curve continuous instead of snapping
+  // back to cost basis (or jumping to today's live price on the
+  // final day, which was the 750% daily-return bug).
+  const carryMark = new Map<string, number>();
+  for (const t of trades) {
+    const tk = t.ticker.toUpperCase();
+    if (!carryMark.has(tk)) {
+      carryMark.set(tk, Number(t.price));
+    }
+  }
+
+  while (cursor < end) {
+    const day = cursor.toISOString().slice(0, 10);
+    const todaysTrades = tradesByDay.get(day) ?? [];
+    for (const t of todaysTrades) {
+      applyTrade(positions, cash, t);
+      cash = applyCash(cash, t);
+      // New fill resets the carry-forward to that fill's price (it
+      // is the freshest mark we know of).
+      carryMark.set(t.ticker.toUpperCase(), Number(t.price));
+    }
+
+    // Mark each open position: prefer the real daily close from
+    // closeMap, otherwise carry forward the previous mark so the
+    // equity curve stays continuous. Cost-basis (`lastFill`) is a
+    // last resort when we have no prior mark at all (e.g. position
+    // opened today with no cached close).
+    let netValue = 0;
+    let grossExposure = 0;
+    for (const [tk, pos] of positions) {
+      const close = closeMap.get(tk)?.get(day);
+      const prior = carryMark.get(tk);
+      const mark = close ?? prior ?? pos.avg_price;
+      if (close != null) carryMark.set(tk, close);
+      const mv = pos.qty * mark;
+      netValue += mv;
+      grossExposure += Math.abs(mv);
+    }
+    const equity = cash + netValue;
+    const dailyReturn = prevEquity != null && prevEquity > 0
+      ? (equity - prevEquity) / prevEquity
+      : null;
+
+    await upsertSnapshotRow(portfolioId, day, {
+      equity,
+      exposure: grossExposure,
+      cash,
+      daily_return: dailyReturn,
+      // L/S jsonb left null for historical rows — see header.
+    });
+
+    prevEquity = equity;
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+}
+
+function applyCash(
+  cash: number,
+  t: { side: 'BUY' | 'SELL'; qty: number; price: number },
+): number {
+  const totalCost = t.qty * t.price;
+  // BUY pays out; SELL receives. Holds for long and short alike.
+  return cash + (t.side === 'BUY' ? -totalCost : totalCost);
+}
+
+/**
+ * In-memory mirror of updatePositionAfterTrade. Mutates `positions`
+ * for the given trade and returns nothing. (We ignore the `cash`
+ * parameter on the signature — kept for symmetry with the live
+ * helper but cash flow is handled by applyCash above.)
+ */
+function applyTrade(
+  positions: Map<string, { qty: number; avg_price: number }>,
+  _cash: number,
+  t: {
+    ticker: string;
+    side: 'BUY' | 'SELL';
+    direction: 'LONG' | 'SHORT' | null;
+    qty: number;
+    price: number;
+  },
+): void {
+  const tk = t.ticker.toUpperCase();
+  const direction = t.direction ?? 'LONG';
+  const existing = positions.get(tk);
+  const signedDelta = t.side === 'BUY' ? t.qty : -t.qty;
+  const newQty = (existing?.qty ?? 0) + signedDelta;
+  if (newQty === 0) {
+    positions.delete(tk);
+    return;
+  }
+  let newAvg: number;
+  if (existing) {
+    const wasLong = existing.qty > 0;
+    const wasShort = existing.qty < 0;
+    const openingLong = direction === 'LONG' && t.side === 'BUY' && !wasLong;
+    const addingToLong = direction === 'LONG' && t.side === 'BUY' && wasLong;
+    const openingShort = direction === 'SHORT' && t.side === 'SELL' && !wasShort;
+    const addingToShort = direction === 'SHORT' && t.side === 'SELL' && wasShort;
+    if (openingLong) newAvg = t.price;
+    else if (addingToLong) {
+      newAvg = (existing.qty * existing.avg_price + t.qty * t.price) / newQty;
+    } else if (openingShort) newAvg = t.price;
+    else if (addingToShort) {
+      const existingAbs = Math.abs(existing.qty);
+      newAvg = (existingAbs * existing.avg_price + t.qty * t.price) / (existingAbs + t.qty);
+    } else newAvg = existing.avg_price;
+  } else {
+    newAvg = t.price;
+  }
+  positions.set(tk, { qty: newQty, avg_price: newAvg });
+}
+
+/**
+ * Find the most recent trade fill price for `ticker` on or before
+ * `day`. The trade list is already sorted ascending by executed_at,
+ * so a single reverse pass is enough.
+ */
+function lastFillPriceBefore(
+  trades: Array<{ ticker: string; price: number; executed_at: string }>,
+  ticker: string,
+  day: string,
+): number | null {
+  const tk = ticker.toUpperCase();
+  let best: number | null = null;
+  for (let i = trades.length - 1; i >= 0; i--) {
+    const t = trades[i];
+    if (t.ticker.toUpperCase() !== tk) continue;
+    if (t.executed_at.slice(0, 10) <= day) {
+      best = Number(t.price);
+      break;
+    }
+  }
+  return best;
 }
 
 /**
@@ -798,12 +1291,23 @@ export function triggerSnapshotRefresh(_portfolioId: string): void {
 /**
  * Manual "Recompute snapshots" trigger used by the Risk page's
  * debug button. Awaits the response so the caller can show success
- * / failure to the user. Just calls writeSnapshotAfterTrade now
- * (the edge function path was unreliable in this environment).
+ * / failure to the user. Finds the earliest trade date and passes it
+ * to writeSnapshotAfterTrade so the full back-dated series is
+ * rewritten, not just today's row.
  */
 export async function recomputeSnapshots(portfolioId: string): Promise<{ ok: boolean; error?: string }> {
   try {
-    await writeSnapshotAfterTrade(portfolioId);
+    const { data: earliest } = await supabase
+      .from('trades')
+      .select('executed_at')
+      .eq('portfolio_id', portfolioId)
+      .order('executed_at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    const fromDate = earliest?.executed_at
+      ? String(earliest.executed_at).slice(0, 10)
+      : undefined;
+    await writeSnapshotAfterTrade(portfolioId, fromDate);
     return { ok: true };
   } catch (err) {
     return { ok: false, error: (err as Error).message };
@@ -837,18 +1341,29 @@ export interface PositionHistoryPoint {
 
 /**
  * Replay the trade log for one (portfolio, ticker) pair in
- * chronological order and return a series of (date, qty, avgPrice)
- * points. Uses the same signed-qty / signed-avg rules as
- * updatePositionAfterTrade().
+ * chronological order and return a series of (date, qty, avgPrice,
+ * marketValue, pnl, pnlPct) points. Uses the same signed-qty /
+ * signed-avg rules as updatePositionAfterTrade().
  *
- * The final point is an additional "live" mark using `livePrice` (if
- * provided) so the chart can show today's unrealized P&L. Without
- * `livePrice`, the last trade point is the tail.
+ * The series has one point per calendar day from the earliest trade
+ * date through today (inclusive), so the chart shows a continuous
+ * curve instead of disconnected trade-date dots. Each day is marked
+ * at the close price from `closePriceMap` (ticker -> YYYY-MM-DD ->
+ * close) if available; otherwise the most recent trade fill price on
+ * or before that day; otherwise the running avg_price. P&L is only
+ * populated for the trailing live mark and any days where a real
+ * close exists.
+ *
+ * A final "live" point is appended at today's timestamp using
+ * `livePrice` so the chart can show current unrealized P&L vs the
+ * running cost basis. Without `livePrice`, the last calendar day's
+ * close is the tail.
  */
 export function buildPositionHistory(
   trades: Trade[],
   ticker: string,
   livePrice: number | null = null,
+  closePriceMap: Map<string, number> = new Map(),
 ): PositionHistoryPoint[] {
   const upper = ticker.toUpperCase();
   const relevant = trades
@@ -861,34 +1376,35 @@ export function buildPositionHistory(
 
   if (relevant.length === 0) return [];
 
+  // Build the calendar range: earliest trade date through today.
+  const earliestMs = relevant.reduce(
+    (acc, t) => Math.min(acc, new Date(t.trade_timestamp).getTime()),
+    Number.POSITIVE_INFINITY,
+  );
+  const earliestDate = new Date(earliestMs).toISOString().slice(0, 10);
+  const today = new Date().toISOString().slice(0, 10);
+
+  // Replay trades once into a per-day state table so we know qty /
+  // avgPrice at end-of-day for every day in the range.
+  const sorted = [...relevant].sort((a, b) =>
+    a.trade_timestamp.localeCompare(b.trade_timestamp),
+  );
   let qty = 0;
   let avgPrice = 0;
-  const series: PositionHistoryPoint[] = [];
-
-  for (const t of relevant) {
+  const dailyCostBasis = new Map<string, { qty: number; avgPrice: number }>();
+  for (const t of sorted) {
     const tradeQty = t.qty;
     const tradePrice = t.price;
     const signedDelta = t.side === 'BUY' ? tradeQty : -tradeQty;
     const newQty = qty + signedDelta;
 
     if (newQty === 0) {
-      // Position fully closed/covered. Keep prior avg as a marker, qty = 0.
-      series.push({
-        date: t.trade_timestamp,
-        qty: 0,
-        avgPrice,
-        marketValue: 0,
-        pnl: null,
-        pnlPct: null,
-        isLive: false,
-      });
       qty = 0;
       avgPrice = 0;
+      dailyCostBasis.set(t.trade_timestamp.slice(0, 10), { qty: 0, avgPrice: 0 });
       continue;
     }
 
-    // Determine if this trade opens or adds (in which case the basis
-    // changes) or closes/covers (basis preserved).
     const wasLong = qty > 0;
     const wasShort = qty < 0;
     const direction = (t.direction ?? 'LONG') as 'LONG' | 'SHORT';
@@ -906,31 +1422,79 @@ export function buildPositionHistory(
       const existingAbs = Math.abs(qty);
       newAvg = (existingAbs * avgPrice + tradeQty * tradePrice) / (existingAbs + tradeQty);
     } else {
-      // Closing or covering: basis preserved.
       newAvg = avgPrice;
     }
 
     qty = newQty;
     avgPrice = newAvg;
-
-    series.push({
-      date: t.trade_timestamp,
-      qty,
-      avgPrice,
-      marketValue: qty * avgPrice,
-      pnl: null,
-      pnlPct: null,
-      isLive: false,
-    });
+    dailyCostBasis.set(t.trade_timestamp.slice(0, 10), { qty, avgPrice });
   }
 
-  // Append a "now" point using the live price so the user can see
-  // current unrealized P&L vs the running cost basis.
+  // Walk every calendar day from earliestDate through today.
+  const series: PositionHistoryPoint[] = [];
+  const cursor = new Date(`${earliestDate}T00:00:00Z`);
+  const end = new Date(`${today}T00:00:00Z`);
+  // Last known cost basis before/equal to cursor; updated as we pass
+  // each trade day so days between trades inherit the prior basis.
+  let lastQty = 0;
+  let lastAvg = 0;
+  let lastTradeDay: string | null = null;
+  // Trade days (sorted) for forward-fill lookups.
+  const tradeDayKeys = Array.from(dailyCostBasis.keys()).sort();
+  let tradeDayIdx = 0;
+  while (cursor <= end) {
+    const day = cursor.toISOString().slice(0, 10);
+    if (tradeDayIdx < tradeDayKeys.length && tradeDayKeys[tradeDayIdx] <= day) {
+      while (
+        tradeDayIdx < tradeDayKeys.length &&
+        tradeDayKeys[tradeDayIdx] <= day
+      ) {
+        const basis = dailyCostBasis.get(tradeDayKeys[tradeDayIdx])!;
+        lastQty = basis.qty;
+        lastAvg = basis.avgPrice;
+        lastTradeDay = tradeDayKeys[tradeDayIdx];
+        tradeDayIdx++;
+      }
+    }
+
+    const close = closePriceMap.get(day);
+    // Mark priority: real close > last trade fill price on/before day >
+    // running avg_price. lastTradeDay carries the fill price via the
+    // running avg, so for the no-close case we just use lastAvg.
+    const mark = close ?? (lastQty !== 0 ? lastAvg : null);
+    const dayIsToday = day === today;
+    // Only emit a point if the position existed on or before this day
+    // (we know it did once we're past lastTradeDay) OR the position is
+    // currently open (so we still want a "today" baseline). Skip days
+    // strictly before the first trade even though the loop won't
+    // reach them since we started at earliestDate.
+    if (lastQty !== 0 || dayIsToday) {
+      const marketValue = lastQty * (mark ?? lastAvg);
+      const cost = lastQty * lastAvg;
+      const hasPnl = mark != null && lastAvg > 0 && lastQty !== 0;
+      const pnl = hasPnl ? marketValue - cost : null;
+      const pnlPct = hasPnl && cost !== 0 ? (pnl! / Math.abs(cost)) * 100 : null;
+      series.push({
+        date: `${day}T00:00:00Z`,
+        qty: lastQty,
+        avgPrice: lastAvg,
+        marketValue,
+        pnl,
+        pnlPct,
+        isLive: false,
+      });
+    }
+
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+
+  // Append a final live-mark point using livePrice so the user sees
+  // today's unrealized P&L against the most recent cost basis.
   if (livePrice != null && livePrice > 0 && qty !== 0) {
     const mv = qty * livePrice;
     const cost = qty * avgPrice;
     const pnl = mv - cost;
-    const pnlPct = cost > 0 ? (pnl / cost) * 100 : 0;
+    const pnlPct = cost > 0 ? (pnl / Math.abs(cost)) * 100 : 0;
     series.push({
       date: new Date().toISOString(),
       qty,
@@ -952,14 +1516,19 @@ export function buildPositionHistory(
 export function computePerformanceMetrics(
   portfolio: Portfolio,
   positions: Position[],
-  snapshots: DailySnapshot[]
+  snapshots: DailySnapshot[],
+  trades: Trade[] = []
 ) {
   const totalExposure = positions.reduce(
     (sum, p) => sum + p.qty * (p.current_price || p.avg_price),
     0
   );
   const equity = portfolio.current_capital + totalExposure;
-  const totalReturn = ((equity - portfolio.initial_capital) / portfolio.initial_capital) * 100;
+  const baselineEquity = trades.length > 0
+    ? computeBuyBaselineEquity(portfolio.initial_capital, trades, snapshots)
+    : portfolio.initial_capital;
+  const totalReturn =
+    baselineEquity > 0 ? ((equity - baselineEquity) / baselineEquity) * 100 : 0;
 
   const returns = snapshots
     .map((s) => s.daily_return)
@@ -974,7 +1543,7 @@ export function computePerformanceMetrics(
 
   // Max drawdown
   let maxDrawdown = 0;
-  let peak = portfolio.initial_capital;
+  let peak = baselineEquity;
   for (const s of snapshots) {
     if (s.equity > peak) peak = s.equity;
     const drawdown = ((peak - s.equity) / peak) * 100;
