@@ -159,6 +159,45 @@ export function AIChatPage() {
       const result = await callAI('parse', { command: input });
       setParsed(result);
 
+      // Auto-select portfolio if mentioned — must run BEFORE the
+      // basis-preview equity fetch below, so a parse like "in
+      // Aggressive Growth, spend 10% of my portfolio on AAPL"
+      // computes the preview against the newly-selected portfolio
+      // rather than the previously-active one.
+      if (result.portfolio_id) {
+        setSelectedPortfolio(result.portfolio_id);
+      } else if (result.portfolio_name) {
+        const match = portfolios.find(
+          (p) => p.name.toLowerCase() === result.portfolio_name?.toLowerCase(),
+        );
+        if (match) setSelectedPortfolio(match.id);
+      }
+
+      // For percentage / fraction sized legs ("spend 10% of my
+      // portfolio on AAPL", "half on NVDA"), the server returns
+      // `notional_basis` + `notional_pct`/`notional_fraction` but
+      // can't seed a share count — the basis resolves against the
+      // target portfolio's live equity, which the server doesn't
+      // know. Fetch the portfolio state here so we can show a
+      // preview qty in the qty box before the user clicks Execute.
+      let basisPreview: { cash: number; equity: number } | null = null;
+      const needsBasis = (result.legs ?? []).some(
+        (l: ParsedLeg) =>
+          (l.notional_basis ?? 'USD') !== 'USD' && (l.qty == null || l.qty === ''),
+      );
+      const targetPortfolioId =
+        result.portfolio_id || selectedPortfolio || portfolios[0]?.id || '';
+      if (needsBasis && targetPortfolioId) {
+        try {
+          const eq = await computePortfolioEquity(targetPortfolioId);
+          basisPreview = { cash: eq.cash, equity: eq.equity };
+        } catch (err) {
+          // Non-fatal — the qty box will just stay empty. The system
+          // still resolves the basis at execute time.
+          console.warn('basis-preview equity fetch failed:', err);
+        }
+      }
+
       // Seed inline-editable values for each leg. Keyed by leg INDEX
       // (not ticker) so the edits survive a re-parse even if the
       // ticker text changes.
@@ -172,9 +211,13 @@ export function AIChatPage() {
       legList.forEach((l, i) => {
         // Priority for the qty box:
         //   1. LLM-supplied explicit qty (e.g. "buy 100 AAPL").
-        //   2. Server-computed preview_qty for notional-based legs
+        //   2. Server-computed preview_qty for USD notional legs
         //      (e.g. "$1M of NVDA" → floor(1_000_000 / $204.65) ≈ 4886).
-        //   3. Empty — the user will fill it in, or the system will
+        //   3. Client-computed basis preview for PCT / FRACTION legs
+        //      using the live portfolio equity + the leg's resolved
+        //      price. ("spend 10% of my portfolio on AAPL" → qty ≈
+        //      floor(equity * 0.10 / AAPL_price).)
+        //   4. Empty — the user will fill it in, or the system will
         //      fail at execute time with a clear "Quantity required"
         //      error.
         let qtySeed = '';
@@ -182,6 +225,20 @@ export function AIChatPage() {
           qtySeed = String(l.qty);
         } else if (l.preview_qty != null && l.preview_qty > 0) {
           qtySeed = String(l.preview_qty);
+        } else if (
+          basisPreview != null &&
+          (l.notional_basis ?? 'USD') !== 'USD' &&
+          l.resolved_price != null &&
+          l.resolved_price > 0
+        ) {
+          const previewNotional = notionalFromBasis(
+            l,
+            basisPreview.cash,
+            basisPreview.equity,
+          );
+          if (previewNotional != null && previewNotional > 0) {
+            qtySeed = String(Math.floor(previewNotional / l.resolved_price));
+          }
         }
         seeds[i] = {
           ticker: (l.ticker ?? '').toString().toUpperCase(),
@@ -190,16 +247,6 @@ export function AIChatPage() {
       });
       setLegEdits(seeds);
       setRefetchingLegs(new Set());
-
-      // Auto-select portfolio if mentioned
-      if (result.portfolio_id) {
-        setSelectedPortfolio(result.portfolio_id);
-      } else if (result.portfolio_name) {
-        const match = portfolios.find(
-          (p) => p.name.toLowerCase() === result.portfolio_name?.toLowerCase()
-        );
-        if (match) setSelectedPortfolio(match.id);
-      }
     } catch (err: any) {
       setMessage({ type: 'error', text: err.message });
     } finally {
@@ -866,6 +913,31 @@ function pickPrice(
 // a future cleanup pass if desired.)
 
 /**
+ * Pure-math mirror of `resolveLegBasisToNotional` for callers that
+ * already have the live cash + equity in hand (e.g. the qty-seed
+ * step in `handleParse`). Returns the resolved USD notional for a
+ * non-USD basis, or null for USD / unknown basis / missing values.
+ * Must stay in sync with the async version above.
+ */
+function notionalFromBasis(
+  leg: ParsedLeg,
+  cash: number,
+  equity: number,
+): number | null {
+  const basis = leg.notional_basis ?? 'USD';
+  if (basis === 'USD') return null;
+  const base = basis === 'PCT_CASH' || basis === 'FRACTION_CASH' ? cash : equity;
+  if (basis === 'PCT_PORTFOLIO' || basis === 'PCT_CASH') {
+    const pct = leg.notional_pct ?? 0;
+    if (pct <= 0) return null;
+    return Math.floor((base * pct) / 100);
+  }
+  const frac = leg.notional_fraction ?? 0;
+  if (frac <= 0) return null;
+  return Math.floor(base * frac);
+}
+
+/**
  * Resolve a leg's notional_basis into a USD notional using the live
  * portfolio state. Returns null when the basis is USD (caller should
  * use the leg's explicit `notional` field instead) or when the leg
@@ -883,22 +955,17 @@ async function resolveLegBasisToNotional(
   const basis = leg.notional_basis ?? 'USD';
   if (basis === 'USD') return null;
   const { cash, equity } = await computePortfolioEquity(portfolioId);
-  const base = basis === 'PCT_CASH' || basis === 'FRACTION_CASH' ? cash : equity;
+  const notional = notionalFromBasis(leg, cash, equity);
+  if (notional == null) return null;
+  let basisLabel: string;
   if (basis === 'PCT_PORTFOLIO' || basis === 'PCT_CASH') {
     const pct = leg.notional_pct ?? 0;
-    if (pct <= 0) return null;
-    return {
-      notional: Math.floor((base * pct) / 100),
-      basisLabel: `${pct}% of ${basis === 'PCT_CASH' ? 'cash' : 'portfolio equity'}`,
-    };
+    basisLabel = `${pct}% of ${basis === 'PCT_CASH' ? 'cash' : 'portfolio equity'}`;
+  } else {
+    const frac = leg.notional_fraction ?? 0;
+    basisLabel = `${formatFractionLabel(frac)} of ${basis === 'FRACTION_CASH' ? 'cash' : 'portfolio equity'}`;
   }
-  // FRACTION_PORTFOLIO / FRACTION_CASH
-  const frac = leg.notional_fraction ?? 0;
-  if (frac <= 0) return null;
-  return {
-    notional: Math.floor(base * frac),
-    basisLabel: `${formatFractionLabel(frac)} of ${basis === 'FRACTION_CASH' ? 'cash' : 'portfolio equity'}`,
-  };
+  return { notional, basisLabel };
 }
 
 function formatFractionLabel(f: number): string {

@@ -33,6 +33,7 @@ import {
   getPositions,
   getTrades,
   getSnapshots,
+  fillSnapshotGap,
   recomputeSnapshots,
   type Portfolio,
   type Position,
@@ -132,6 +133,26 @@ export function RiskPage() {
       setData(null);
       return;
     }
+    // Silently heal any gap in `daily_snapshots` between the latest
+    // existing row and the most recent trading day. Without this,
+    // portfolios with no recent trade show a flat carry-forward
+    // "right edge" on the equity curve even though live prices have
+    // been ticking via the Python scheduler. Runs AFTER getSnapshots
+    // and BEFORE re-reading them so the page that follows renders on
+    // the freshly-backfilled series.
+    try {
+      await fillSnapshotGap(id);
+    } catch (err) {
+      console.warn('fillSnapshotGap failed (non-fatal):', err);
+    }
+    // Re-read snapshots so any rows written by fillSnapshotGap are
+    // included in the chart and risk metrics below.
+    let latestSnapshots = snapshots;
+    try {
+      latestSnapshots = await getSnapshots(id, 365);
+    } catch (err) {
+      console.warn('snapshot re-read after gap-fill failed (non-fatal):', err);
+    }
     // Market-derived history series. Fetched AFTER the core data so
     // the page can render positions/trades immediately even if the
     // Bloomberg backfill is slow. A failure here is non-fatal —
@@ -147,7 +168,7 @@ export function RiskPage() {
         console.warn('history-series fetch failed; falling back to snapshots:', err);
       }
     }
-    setData({ portfolio, positions, trades, snapshots, historySeries });
+    setData({ portfolio, positions, trades, snapshots: latestSnapshots, historySeries });
   };
 
   useEffect(() => {
@@ -632,6 +653,7 @@ export function RiskPage() {
         <PortfolioEquityChart
           snapshots={data.snapshots}
           initialCapital={data.portfolio.initial_capital}
+          sharpeRatio={metrics?.sharpeRatio ?? null}
         />
       </div>
 

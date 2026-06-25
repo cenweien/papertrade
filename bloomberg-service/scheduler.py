@@ -292,13 +292,17 @@ def cleanup_stale(active: set[str]) -> None:
 # -----------------------------------------------------------------------------
 def _post_compute_snapshots(portfolio_id: str | None = None,
                             date_str: str | None = None,
-                            days: int = 5) -> bool:
+                            days: int = 30) -> bool:
     """POST /functions/v1/compute-snapshots with the INTERNAL_API_KEY
     shared secret. Returns True on 2xx, False on any error (logged).
 
-    The default `days=5` keeps a 5-day rolling window of snapshots
+    The default `days=30` keeps a 30-day rolling window of snapshots
     fresh so the Risk page's Sharpe / Sortino / VaR / drawdown
-    metrics are non-degenerate after a single daily tick.
+    metrics are non-degenerate after a single daily tick — enough
+    days for a 20-day rolling Sharpe to compute. The edge function
+    now marks historical dates at the real daily close from
+    `instrument_price_history`, so a 30-day window produces real
+    day-over-day drift instead of a flat equity line.
     """
     if not INTERNAL_API_KEY:
         log.debug("INTERNAL_API_KEY not set; skipping compute-snapshots call")
@@ -338,7 +342,7 @@ def _post_compute_snapshots(portfolio_id: str | None = None,
 
 def trigger_daily_snapshots_if_due(last_run_date: str | None) -> str | None:
     """Once per UTC day, at SNAPSHOT_TICK_HOUR:SNAPSHOT_TICK_MINUTE, call
-    compute-snapshots for all portfolios with a 5-day rolling window.
+    compute-snapshots for all portfolios with a 30-day rolling window.
     Returns the new `last_run_date` (YYYY-MM-DD UTC) or the existing
     one if the tick hasn't fired yet. The function is cheap when not
     due — just a date check.
@@ -359,8 +363,8 @@ def trigger_daily_snapshots_if_due(last_run_date: str | None) -> str | None:
     # past the target minute (we only compare on date, not minute, so
     # 5-minute loop may run a second cycle after the tick — that's
     # fine, compute-snapshots is idempotent on (portfolio, date)).
-    log.info("Daily snapshot tick firing for %s (UTC, 5-day window)", today)
-    _post_compute_snapshots(portfolio_id=None, date_str=today, days=5)
+    log.info("Daily snapshot tick firing for %s (UTC, 30-day window)", today)
+    _post_compute_snapshots(portfolio_id=None, date_str=today, days=30)
     return today
 
 

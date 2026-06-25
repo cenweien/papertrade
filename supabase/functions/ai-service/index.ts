@@ -65,6 +65,17 @@ const HISTORICAL_FETCH_TIMEOUT_MS = 8_000;
 const STOPWORDS = new Set([
   // Action verbs
   'BUY', 'SELL', 'CLOSE', 'COVER', 'SHORT', 'LONG',
+  // Sizing verbs the user says instead of "buy" — these precede a
+  // dollar amount or percentage and must not be picked up as a
+  // ticker ("spend 10% of my portfolio on AAPL" was matching SPEND).
+  'SPEND', 'INVEST', 'ALLOCATE', 'DEPLOY', 'PUT', 'DUMP', 'LOAD',
+  // Position-direction verbs / slang that look like 3-5 letter words
+  // to the token scan and are almost never the actual ticker.
+  // (Real tickers that would falsely be stripped: none of these are
+  // active US equity symbols as of 2026.)
+  'OPEN', 'ENTER', 'EXIT', 'HOLD', 'TAKE', 'ADD', 'GAIN', 'LOSE',
+  // Trading slang — same reason. None of these are real tickers.
+  'DIP', 'HODL', 'MOON', 'YOLO', 'FOMO', 'BTD', 'BTFD',
   // Prepositions / articles
   'AT', 'IN', 'ON', 'TO', 'OF', 'FOR', 'WITH', 'AND', 'OR', 'THE',
   'A', 'AN', 'IS', 'IT', 'MY', 'BY', 'NOT', 'NO', 'AS',
@@ -74,7 +85,7 @@ const STOPWORDS = new Set([
   'HIGH', 'LOW', 'MORE', 'LESS', 'JUST', 'ONLY', 'ALSO', 'HAVE', 'WILL',
   'AFTER', 'BEFORE',
   // Order-type words
-  'STOP', 'LOSS', 'LIMIT', 'MARKET', 'ENTRY', 'EXIT',
+  'STOP', 'LOSS', 'LIMIT', 'MARKET', 'ENTRY',
   // Time units
   'DAY', 'DAYS', 'WEEK', 'WEEKS', 'MONTH', 'MONTHS',
   'YEAR', 'YEARS', 'QUARTER', 'QUARTERS', 'HOUR', 'HOURS',
@@ -86,6 +97,10 @@ const STOPWORDS = new Set([
   'USD', 'JPY', 'EUR', 'GBP', 'CHF', 'CAD', 'AUD', 'NZD',
   'HKD', 'SGD', 'CNY', 'CNH', 'KRW', 'INR',
   'DOLLAR', 'DOLLARS', 'CENT', 'CENTS',
+  // "CASH" is a sizing base word ("10% of my cash"), not a ticker.
+  // Real CASH-prefixed tickers (CASY, CASS, CASHU) all have a
+  // trailing letter that the 1-5 letter token scan won't strip.
+  'CASH',
   // Option / derivative words
   'CALL', 'PUT', 'ITM', 'OTM', 'ATM', 'STRIKE', 'EXPIRY',
   // Magnitude suffixes
@@ -1161,8 +1176,10 @@ function inferLegAction(
   // separated from the ticker by an adverb ("at market", "now"), a
   // date ("2 days ago"), or a price-type keyword — none of those
   // are verbs, so we keep looking back. Past-tense forms (BOUGHT,
-  // SOLD) collapse to the present-tense base action.
-  const verbRe = /\b(BUY|BOUGHT|SELL|SOLD|SHORT|SHORTED|COVER|COVERED|CLOSE|CLOSED)\b/g;
+  // SOLD) collapse to the present-tense base action. Sizing verbs
+  // (SPEND, INVEST, ALLOCATE, PUT) all imply BUY and are mapped to
+  // it below.
+  const verbRe = /\b(BUY|BOUGHT|SELL|SOLD|SHORT|SHORTED|COVER|COVERED|CLOSE|CLOSED|SPEND|INVEST|ALLOCATE)\b/g;
   let last: RegExpExecArray | null = null;
   let v: RegExpExecArray | null;
   while ((v = verbRe.exec(beforeTicker)) !== null) last = v;
@@ -1177,12 +1194,15 @@ function inferLegAction(
       return null;
     }
   }
-  // Map past tense to present.
+  // Map past tense and sizing verbs to the equivalent present-tense
+  // action. SPEND / INVEST / ALLOCATE are sizing verbs, not direction
+  // verbs — they all imply a BUY.
   if (verb === 'BOUGHT') return 'BUY';
   if (verb === 'SOLD') return 'SELL';
   if (verb === 'SHORTED') return 'SHORT';
   if (verb === 'COVERED') return 'COVER';
   if (verb === 'CLOSED') return 'CLOSE';
+  if (verb === 'SPEND' || verb === 'INVEST' || verb === 'ALLOCATE') return 'BUY';
   return verb as 'BUY' | 'SELL' | 'CLOSE' | 'SHORT' | 'COVER';
 }
 

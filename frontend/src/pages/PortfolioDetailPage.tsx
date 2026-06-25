@@ -8,30 +8,15 @@ import {
   getTrades,
   executeTrade,
   getSnapshots,
-  computePerformanceMetrics,
+  fillSnapshotGap,
+  computeBuyBaselineEquity,
   type Portfolio,
   type Position,
   type Trade,
   type DailySnapshot,
 } from '@/services/db';
 import { useLivePrices, refreshQuote, getQuote } from '@/services/marketData';
-import { getHistorySeriesLastDays, type HistorySeries } from '@/services/marketHistory';
-import { PortfolioEquityChart, PositionPnLChart } from '@/components/PnLCharts';
-import { computeRiskMetrics, type LivePriceMap } from '@/services/riskMetrics';
-
-// Lookback window for the market-derived return series; matches the
-// Risk page and the bloomberg-service scheduler default.
-const HISTORY_LOOKBACK_DAYS = 365;
-
-// Compact $ formatter for the L/S summary strip ($1.2M, $450k, etc.).
-function fmtMoneyShort(n: number): string {
-  const abs = Math.abs(n);
-  const sign = n < 0 ? '-' : '';
-  if (abs >= 1_000_000_000) return `${sign}$${(abs / 1_000_000_000).toFixed(2)}B`;
-  if (abs >= 1_000_000) return `${sign}$${(abs / 1_000_000).toFixed(2)}M`;
-  if (abs >= 1_000) return `${sign}$${(abs / 1_000).toFixed(1)}k`;
-  return `${sign}$${abs.toFixed(0)}`;
-}
+import { PerformanceCharts, RangeTabs, type TimeRange } from '@/components/PerformanceCharts';
 
 export function PortfolioDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -39,11 +24,8 @@ export function PortfolioDetailPage() {
   const [positions, setPositions] = useState<Position[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [snapshots, setSnapshots] = useState<DailySnapshot[]>([]);
-  const [historySeries, setHistorySeries] = useState<HistorySeries[]>([]);
+  const [chartRange, setChartRange] = useState<TimeRange>('DAILY');
   const [loading, setLoading] = useState(true);
-  // Ticker of the position whose P&L chart is currently shown.
-  // Defaults to the first position; if none, empty string.
-  const [selectedTicker, setSelectedTicker] = useState<string>('');
 
   // Trade form state
   const [showTradeForm, setShowTradeForm] = useState(false);
@@ -98,23 +80,26 @@ export function PortfolioDetailPage() {
       setPositions(pos);
       setTrades(trds);
       setSnapshots(snaps);
-      setSelectedTicker((cur) => cur || (pos[0]?.ticker ?? ''));
-      // Market-derived history series for Sharpe / VaR / CVaR /
-      // Sortino. Failure is non-fatal — computeRiskMetrics falls back
-      // to the snapshot-derived series when historySeries is empty.
-      const heldTickers = pos
-        .map((p2) => p2.ticker?.toUpperCase())
-        .filter(Boolean) as string[];
-      if (heldTickers.length > 0) {
-        try {
-          const hist = await getHistorySeriesLastDays(heldTickers, HISTORY_LOOKBACK_DAYS);
-          setHistorySeries(hist);
-        } catch (err) {
-          console.warn('history-series fetch failed; falling back to snapshots:', err);
-          setHistorySeries([]);
-        }
-      } else {
-        setHistorySeries([]);
+      // Silently heal any gap in daily_snapshots between the latest
+      // existing row and the most recent trading day. Without this,
+      // portfolios with no recent trade show a flat carry-forward
+      // "right edge" on the equity curve and rolling Sharpe stays
+      // null (every snapshot row gets marked at the same live tick,
+      // so daily_return = 0 for every idle day). Same shape as the
+      // RiskPage heal — see fillSnapshotGap in db.ts.
+      try {
+        await fillSnapshotGap(id);
+      } catch (err) {
+        console.warn('fillSnapshotGap failed (non-fatal):', err);
+      }
+      // Re-read snapshots so the freshly-written rows (today's mark
+      // + any backfilled intermediate days) show up in the charts.
+      let finalSnaps = snaps;
+      try {
+        finalSnaps = await getSnapshots(id, 365);
+        setSnapshots(finalSnaps);
+      } catch (err) {
+        console.warn('snapshot re-read after gap-fill failed (non-fatal):', err);
       }
     } catch (err) {
       console.error('Failed to load portfolio:', err);
@@ -247,7 +232,13 @@ export function PortfolioDetailPage() {
     return sum + p.qty * px;
   }, 0);
   const equity = portfolio.current_capital + totalExposure;
-  const totalReturn = ((equity - portfolio.initial_capital) / portfolio.initial_capital) * 100;
+  const baselineEquity = computeBuyBaselineEquity(
+    portfolio.initial_capital,
+    trades,
+    snapshots,
+  );
+  const totalReturn =
+    baselineEquity > 0 ? ((equity - baselineEquity) / baselineEquity) * 100 : 0;
   const isPositive = totalReturn >= 0;
   const hasLiveData = Object.keys(quotes).length > 0;
 
@@ -323,17 +314,16 @@ export function PortfolioDetailPage() {
         </div>
       </div>
 
-      {/* Portfolio equity curve (from daily_snapshots) */}
-      <div className="card mb-6">
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-lg font-semibold">Portfolio Equity Over Time</h2>
-          <span className="text-xs text-slate-500">
-            {snapshots.length} snapshot{snapshots.length === 1 ? '' : 's'}
-          </span>
+      {/* Performance charts */}
+      <div className="mb-6">
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-slate-900">Performance</h2>
+          <RangeTabs value={chartRange} onChange={setChartRange} />
         </div>
-        <PortfolioEquityChart
+        <PerformanceCharts
           snapshots={snapshots}
           initialCapital={portfolio.initial_capital}
+          range={chartRange}
         />
       </div>
 
@@ -489,44 +479,6 @@ export function PortfolioDetailPage() {
         </div>
       )}
 
-      {/* Per-position P&L chart */}
-      {positions.length > 0 && (
-        <div className="card mb-6">
-          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-            <h2 className="text-lg font-semibold">Position P&L Over Time</h2>
-            <div className="flex items-center gap-2">
-              <label className="text-xs text-slate-500" htmlFor="pnl-ticker">
-                Ticker
-              </label>
-              <select
-                id="pnl-ticker"
-                value={selectedTicker}
-                onChange={(e) => setSelectedTicker(e.target.value)}
-                className="input py-1 text-sm"
-              >
-                {positions.map((p) => (
-                  <option key={p.id} value={p.ticker}>
-                    {p.ticker}
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
-          {(() => {
-            const pos = positions.find((p) => p.ticker === selectedTicker) ?? positions[0];
-            if (!pos) return null;
-            const live = quotes[pos.ticker];
-            return (
-              <PositionPnLChart
-                position={pos}
-                trades={trades as any}
-                livePrice={live?.current_price ?? pos.current_price ?? null}
-              />
-            );
-          })()}
-        </div>
-      )}
-
       {/* Positions */}
       <div className="card mb-6">
         <div className="mb-4 flex items-center justify-between">
@@ -543,66 +495,6 @@ export function PortfolioDetailPage() {
             </button>
           )}
         </div>
-
-        {/* T1.4: Long/Short subtotals strip */}
-        {positions.length > 0 && (() => {
-          const livePrices: LivePriceMap = {};
-          for (const [tk, q] of Object.entries(quotes)) {
-            livePrices[tk] = { current_price: q.current_price, sector: q.sector };
-          }
-          const metrics = computeRiskMetrics({
-            portfolio,
-            positions,
-            trades,
-            snapshots,
-            livePrices,
-            historySeries,
-          });
-          const longs = positions.filter((p) => p.qty > 0).length;
-          const shorts = positions.filter((p) => p.qty < 0).length;
-          const grossAbs = metrics.grossExposure;
-          const equityForPct = metrics.equity || 1;
-          return (
-            <div className="mb-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
-              <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
-                <div className="text-[10px] uppercase text-slate-500">Longs</div>
-                <div className="text-sm font-semibold text-blue-700">
-                  {longs} pos · {fmtMoneyShort(metrics.longExposure)}{' '}
-                  <span className="text-xs font-normal text-slate-500">
-                    ({((metrics.longExposure / grossAbs) * 100).toFixed(0)}% gross)
-                  </span>
-                </div>
-              </div>
-              <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
-                <div className="text-[10px] uppercase text-slate-500">Shorts</div>
-                <div className="text-sm font-semibold text-purple-700">
-                  {shorts} pos · {fmtMoneyShort(Math.abs(metrics.shortExposure))}{' '}
-                  <span className="text-xs font-normal text-slate-500">
-                    ({((Math.abs(metrics.shortExposure) / grossAbs) * 100).toFixed(0)}% gross)
-                  </span>
-                </div>
-              </div>
-              <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
-                <div className="text-[10px] uppercase text-slate-500">Net</div>
-                <div className={`text-sm font-semibold ${metrics.netExposure >= 0 ? 'text-green-700' : 'text-red-700'}`}>
-                  {fmtMoneyShort(metrics.netExposure)}{' '}
-                  <span className="text-xs font-normal text-slate-500">
-                    ({((metrics.netExposure / equityForPct) * 100).toFixed(0)}% eq)
-                  </span>
-                </div>
-              </div>
-              <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
-                <div className="text-[10px] uppercase text-slate-500">Gross</div>
-                <div className="text-sm font-semibold text-slate-900">
-                  {fmtMoneyShort(metrics.grossExposure)}{' '}
-                  <span className="text-xs font-normal text-slate-500">
-                    ({((metrics.grossExposure / equityForPct) * 100).toFixed(0)}% eq)
-                  </span>
-                </div>
-              </div>
-            </div>
-          );
-        })()}
 
         {positions.length === 0 ? (
           <p className="text-sm text-slate-500">No positions yet. Execute a BUY trade to start.</p>
@@ -766,54 +658,6 @@ export function PortfolioDetailPage() {
                   </tbody>
                 </table>
               </div>
-
-              {/* T1.4: Concentration footer */}
-              {(() => {
-                const livePrices: LivePriceMap = {};
-                for (const [tk, q] of Object.entries(quotes)) {
-                  livePrices[tk] = { current_price: q.current_price, sector: q.sector };
-                }
-                const concMetrics = computeRiskMetrics({
-                  portfolio,
-                  positions,
-                  trades,
-                  snapshots,
-                  livePrices,
-                  historySeries,
-                }).concentration;
-                return (
-                  <div className="mt-4 grid grid-cols-2 gap-3 border-t border-slate-200 pt-3 sm:grid-cols-4">
-                    <div>
-                      <div className="text-[10px] uppercase text-slate-500">HHI Long</div>
-                      <div className="text-sm font-semibold text-slate-900">
-                        {concMetrics.herfindahlLong.toFixed(3)}
-                      </div>
-                      <div className="text-[10px] text-slate-400">0 = diversified · 1 = one name</div>
-                    </div>
-                    <div>
-                      <div className="text-[10px] uppercase text-slate-500">HHI Short</div>
-                      <div className="text-sm font-semibold text-slate-900">
-                        {concMetrics.herfindahlShort.toFixed(3)}
-                      </div>
-                      <div className="text-[10px] text-slate-400">0 = diversified · 1 = one name</div>
-                    </div>
-                    <div>
-                      <div className="text-[10px] uppercase text-slate-500">Top 5 % Gross</div>
-                      <div className="text-sm font-semibold text-slate-900">
-                        {concMetrics.top5GrossPct.toFixed(1)}%
-                      </div>
-                      <div className="text-[10px] text-slate-400">Concentration in top 5 names</div>
-                    </div>
-                    <div>
-                      <div className="text-[10px] uppercase text-slate-500">Largest Single</div>
-                      <div className="text-sm font-semibold text-slate-900">
-                        {concMetrics.largestSinglePct.toFixed(1)}%
-                      </div>
-                      <div className="text-[10px] text-slate-400">Biggest name / total gross</div>
-                    </div>
-                  </div>
-                );
-              })()}
             </>
           );
         })()}
