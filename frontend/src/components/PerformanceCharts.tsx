@@ -28,7 +28,11 @@ interface PerformanceChartsProps {
 const RANGE_DAYS: Record<TimeRange, number | null> = {
   '5D': 5,
   WEEK: 7,
-  DAILY: 30,
+  // 90 calendar days → ~63 trading days after weekend filter, enough
+  // to render the 20-day rolling Sharpe meaningfully (the first ~19
+  // trading days are null while the window warms up, but the rest of
+  // the chart shows actual values).
+  DAILY: 90,
   YTD: null,
   ALL: null,
 };
