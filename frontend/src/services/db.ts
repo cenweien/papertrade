@@ -1,6 +1,7 @@
 // Database service - direct Supabase calls
 import { supabase } from '@/lib/supabase';
 import type { Database } from '@/types/database.types';
+import { getHistorySeries } from './marketHistory';
 
 // These types match the SQL schema exactly
 export type Portfolio = Database['public']['Tables']['portfolios']['Row'];
@@ -942,21 +943,34 @@ export async function writeSnapshotAfterTrade(
       position_jsonb: todaySnapshot.positionJsonb,
     });
 
-    // 5. If the trade is back-dated, backfill every calendar day
-    // from the earliest trade through yesterday. Today is already
-    // written above with live marks; historical days use trade fill
-    // prices as the mark.
+    // 5. If the trade is back-dated, prime instrument_price_history with
+    // a Bloomberg historical-series fetch covering every held ticker
+    // from the trade date through today (merged from
+    // fix/weekend-filter-and-backfill-mark). Without this, the
+    // backfill would have to mark most days at the trade fill price
+    // and then jump to the live mark on the last day, producing a
+    // single-day daily_return spike. Failures are non-fatal — the
+    // backfill then falls back to carry-forward marks.
     if (tradeDate < today && tradeList.length > 0) {
+      try {
+        const backfillTickers = Array.from(
+          new Set(tradeList.map((t) => t.ticker.toUpperCase())),
+        );
+        await getHistorySeries(backfillTickers, tradeDate, today);
+      } catch (err) {
+        console.warn(
+          'historical-series priming failed; backfill will fall back to carry-forward marks:',
+          err,
+        );
+      }
       await backfillHistoricalSnapshots(portfolioId, tradeList, tradeDate, today);
     }
 
-    // 6. Patch today's daily_return vs the prior *trading* day. Done
+    // 6. Patch today's daily_return vs the prior snapshot row. Done
     // AFTER backfill so the prior row is yesterday, not the trade
     // date — otherwise the first day's chart would show the entire
-    // back-dated period as a single "daily" return. We walk back
-    // over weekends + US holidays so a Monday measure against the
-    // prior Friday's close, not the flat Saturday carry-forward.
-    const priorDate = await getPriorTradingSnapshotDate(portfolioId, today);
+    // back-dated period as a single "daily" return.
+    const priorDate = await getPriorSnapshotDate(portfolioId, today);
     if (priorDate) {
       const priorEquity = await getSnapshotEquity(portfolioId, priorDate);
       if (priorEquity != null && priorEquity > 0) {
@@ -1051,38 +1065,33 @@ function computeLiveSnapshot(
 }
 
 /**
- * Insert-or-update a snapshot row via the (portfolio_id, snapshot_date)
- * unique key. Uses Supabase's native upsert so we only need the
- * INSERT RLS policy (granted in 001_initial_schema.sql) — works
- * whether or not the UPDATE and DELETE policies from 008/010 have
- * been deployed. The previous delete+insert pattern was fragile
- * against RLS: a rejected DELETE silently left the prior row in
- * place, then the INSERT hit a unique-constraint violation and
- * silently lost the new values, leaving the row stuck on the old
- * equity (which is what produced the "no data for June 18" gap).
+ * Delete + insert a snapshot row. DELETE works under the existing
+ * RLS grants; UPDATE does not (merged from
+ * fix/weekend-filter-and-backfill-mark).
  */
 async function upsertSnapshotRow(
   portfolioId: string,
   snapshotDate: string,
   row: Record<string, unknown>,
 ): Promise<void> {
+  await supabase
+    .from('daily_snapshots')
+    .delete()
+    .eq('portfolio_id', portfolioId)
+    .eq('snapshot_date', snapshotDate);
   const { error: insErr } = await supabase
     .from('daily_snapshots')
-    .upsert(
-      { portfolio_id: portfolioId, snapshot_date: snapshotDate, ...row },
-      { onConflict: 'portfolio_id,snapshot_date' },
-    );
+    .insert({ portfolio_id: portfolioId, snapshot_date: snapshotDate, ...row });
   if (insErr) {
-    console.warn(`snapshot upsert failed for ${snapshotDate} (non-fatal):`, insErr);
+    console.warn(`snapshot insert failed for ${snapshotDate} (non-fatal):`, insErr);
   }
 }
 
 /**
  * Update only the `daily_return` column on an existing snapshot row.
  * Used to backfill the today-vs-yesterday return after both rows are
- * known. Reads the existing row, then upserts the full row with the
- * new daily_return value — works under the INSERT-only RLS grant
- * without needing UPDATE/DELETE policies.
+ * known. No UPDATE RLS policy exists, so delete + insert to
+ * overwrite (merged from fix/weekend-filter-and-backfill-mark).
  */
 async function patchDailyReturn(
   portfolioId: string,
@@ -1096,15 +1105,15 @@ async function patchDailyReturn(
     .eq('snapshot_date', snapshotDate)
     .maybeSingle();
   if (!existing) return;
-  const { error: upErr } = await supabase
+  await supabase
     .from('daily_snapshots')
-    .upsert(
-      { ...existing, daily_return: dailyReturn },
-      { onConflict: 'portfolio_id,snapshot_date' },
-    );
-  if (upErr) {
-    console.warn(`daily_return patch failed for ${snapshotDate} (non-fatal):`, upErr);
-  }
+    .delete()
+    .eq('portfolio_id', portfolioId)
+    .eq('snapshot_date', snapshotDate);
+  await supabase.from('daily_snapshots').insert({
+    ...existing,
+    daily_return: dailyReturn,
+  });
 }
 
 async function getPriorSnapshotDate(
@@ -1120,30 +1129,6 @@ async function getPriorSnapshotDate(
     .limit(1)
     .maybeSingle();
   return data?.snapshot_date ?? null;
-}
-
-/**
- * Like getPriorSnapshotDate, but skips weekend + US-market-holiday
- * rows so the return on a Monday measures against the prior Friday's
- * close (not the flat Saturday carry-forward). Looks back up to 14
- * days — a long weekend is at most 3 calendar days, 14 is enough
- * buffer for a one-time clock skew or future holiday cluster.
- */
-async function getPriorTradingSnapshotDate(
-  portfolioId: string,
-  beforeDate: string,
-): Promise<string | null> {
-  const { data } = await supabase
-    .from('daily_snapshots')
-    .select('snapshot_date')
-    .eq('portfolio_id', portfolioId)
-    .lt('snapshot_date', beforeDate)
-    .order('snapshot_date', { ascending: false })
-    .limit(14);
-  for (const row of data ?? []) {
-    if (isTradingDay(row.snapshot_date)) return row.snapshot_date;
-  }
-  return null;
 }
 
 async function getSnapshotEquity(
@@ -1280,15 +1265,22 @@ async function backfillHistoricalSnapshots(
   // backfill, which is cheap.
   const cursor = new Date(`${fromDate}T00:00:00Z`);
   const end = new Date(`${toDateExclusive}T00:00:00Z`);
-  // Track the prior *trading-day* equity, not the prior calendar
-  // day. Non-trading days (weekends + US holidays) carry forward the
-  // last trading day's equity and write daily_return = 0; trading
-  // days compute their return against the last real trading day so
-  // Monday's bar reflects Fri→Mon move, not Fri→flat-Sun→Mon.
-  // Without this, the chart and Sharpe / VaR windows pick up a
-  // string of ~0 returns on weekends and a single "weekly" return
-  // on Mondays, both of which distort the distribution.
-  let prevTradingEquity: number | null = null;
+  // Carry-forward mark per ticker (merged from
+  // fix/weekend-filter-and-backfill-mark). Seed with the trade fill
+  // price so the position starts at cost basis. As real closes arrive
+  // in closeMap we update this; days with no close inherit the previous
+  // mark, keeping the equity curve continuous instead of snapping back
+  // to cost basis (or jumping to today's live price on the final day,
+  // which was the 750% daily-return bug). Weekend filtering now happens
+  // at read time via getSnapshots's isTradingDay filter.
+  let prevEquity: number | null = null;
+  const carryMark = new Map<string, number>();
+  for (const t of trades) {
+    const tk = t.ticker.toUpperCase();
+    if (!carryMark.has(tk)) {
+      carryMark.set(tk, Number(t.price));
+    }
+  }
 
   while (cursor < end) {
     const day = cursor.toISOString().slice(0, 10);
@@ -1296,34 +1288,31 @@ async function backfillHistoricalSnapshots(
     for (const t of todaysTrades) {
       applyTrade(positions, cash, t);
       cash = applyCash(cash, t);
+      // New fill resets the carry-forward to that fill's price (it
+      // is the freshest mark we know of).
+      carryMark.set(t.ticker.toUpperCase(), Number(t.price));
     }
 
-    // Mark each open position: prefer the real daily close, fall
-    // back to the most recent trade fill price on or before `day`,
-    // then to avg_price. This is what makes the curve drift
-    // realistically when Bloomberg history is cached, while still
-    // producing a sane curve (flat at cost basis) when it isn't.
+    // Mark each open position: prefer the real daily close from
+    // closeMap, otherwise carry forward the previous mark so the
+    // equity curve stays continuous. Cost-basis is a last resort
+    // when we have no prior mark at all (e.g. position opened today
+    // with no cached close).
     let netValue = 0;
     let grossExposure = 0;
     for (const [tk, pos] of positions) {
       const close = closeMap.get(tk)?.get(day);
-      const lastFill = lastFillPriceBefore(trades, tk, day);
-      const mark = close ?? lastFill ?? pos.avg_price;
+      const prior = carryMark.get(tk);
+      const mark = close ?? prior ?? pos.avg_price;
+      if (close != null) carryMark.set(tk, close);
       const mv = pos.qty * mark;
       netValue += mv;
       grossExposure += Math.abs(mv);
     }
     const equity = cash + netValue;
-    const isTrading = isTradingDay(day);
-    // On a real trading day, the daily return is the move since the
-    // prior trading day. On a non-trading day we write 0 (no price
-    // action) and do NOT advance prevTradingEquity, so the next
-    // trading day still measures against the last real close.
-    const dailyReturn = !isTrading
-      ? 0
-      : prevTradingEquity != null && prevTradingEquity > 0
-        ? (equity - prevTradingEquity) / prevTradingEquity
-        : null;
+    const dailyReturn = prevEquity != null && prevEquity > 0
+      ? (equity - prevEquity) / prevEquity
+      : null;
 
     await upsertSnapshotRow(portfolioId, day, {
       equity,
@@ -1333,7 +1322,7 @@ async function backfillHistoricalSnapshots(
       // L/S jsonb left null for historical rows — see header.
     });
 
-    if (isTrading) prevTradingEquity = equity;
+    prevEquity = equity;
     cursor.setUTCDate(cursor.getUTCDate() + 1);
   }
 }

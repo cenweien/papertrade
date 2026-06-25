@@ -1,6 +1,6 @@
 // Pure risk-analytics functions. No React, no Supabase.
 // Lives next to db.ts so the db row types can be imported directly.
-import type { Portfolio, Position, Trade, DailySnapshot } from '@/services/db';
+import { isTradingDay, type Portfolio, type Position, type Trade, type DailySnapshot } from '@/services/db';
 import type { HistorySeries } from '@/services/marketHistory';
 
 export const RISK_FREE_RATE = 0.05; // annualized, ~5y US Treasury; configurable later
@@ -200,7 +200,12 @@ export function computeRiskMetrics(input: {
    */
   historySeries?: HistorySeries[];
 }): RiskMetrics {
-  const { portfolio, positions, trades, snapshots, livePrices, historySeries } = input;
+  const { portfolio, positions, trades, snapshots: rawSnapshots, livePrices, historySeries } = input;
+  // Drop weekend snapshot rows up front. The backfill writes a row
+  // for every calendar day; weekends have no real price action and
+  // would inflate the Sharpe window with zero-variance noise and
+  // flatten the drawdown walk.
+  const snapshots = rawSnapshots.filter((s) => isTradingDay(s.snapshot_date));
 
   // --- Position valuation: live -> stored current_price -> avg_price ---
   const positionValues = positions.map((p) => {

@@ -15,7 +15,7 @@ import {
   YAxis,
 } from 'recharts';
 import { format, parseISO } from 'date-fns';
-import type { DailySnapshot } from '@/services/db';
+import { type DailySnapshot, isTradingDay } from '@/services/db';
 
 export type TimeRange = '5D' | 'WEEK' | 'DAILY' | 'YTD' | 'ALL';
 
@@ -38,22 +38,23 @@ function filterByRange(
   range: TimeRange,
 ): DailySnapshot[] {
   if (snapshots.length === 0) return snapshots;
-  // Snapshots arrive pre-filtered (weekends + US holidays dropped in
-  // getSnapshots). The backfill writes one row per calendar day;
-  // non-trading-day rows are inert carry-forward values and would
-  // distort the curve, daily-return bars, and drawdown walk.
-  const last = parseISO(snapshots[snapshots.length - 1].snapshot_date);
+  // Drop weekend rows first — the backfill writes a snapshot for every
+  // calendar day, but weekends have no real price action. Including
+  // them flattens the equity curve, biases daily-return bars toward 0,
+  // and inflates the Sharpe window with zero-variance noise.
+  const tradingOnly = snapshots.filter((s) => isTradingDay(s.snapshot_date));
+  const last = parseISO(tradingOnly[tradingOnly.length - 1].snapshot_date);
   let cutoff: Date;
   if (range === 'YTD') {
     cutoff = new Date(last.getFullYear(), 0, 1);
   } else if (range === 'ALL') {
-    return snapshots;
+    return tradingOnly;
   } else {
     const days = RANGE_DAYS[range] ?? 30;
     cutoff = new Date(last);
     cutoff.setDate(cutoff.getDate() - (days - 1));
   }
-  return snapshots.filter((s) => parseISO(s.snapshot_date) >= cutoff);
+  return tradingOnly.filter((s) => parseISO(s.snapshot_date) >= cutoff);
 }
 
 interface DerivedPoint {
@@ -74,23 +75,17 @@ function deriveSeries(
 
   const base = snapshots[0].equity || initialCapital;
   let peak = base;
-  // Only keep non-null returns for the rolling Sharpe window. A null
-  // return means the backfill had no prior day to anchor against
-  // (first day of a back-dated series). Pushing 0 would bias the
-  // mean and the standard deviation of the window, dragging the
-  // Sharpe toward zero for the first ~20 days.
   const returns: number[] = [];
 
   return snapshots.map((s) => {
-    if (s.daily_return != null) returns.push(s.daily_return);
+    const r = s.daily_return ?? 0;
+    returns.push(r);
     if (s.equity > peak) peak = s.equity;
     const drawdown = peak > 0 ? ((peak - s.equity) / peak) * 100 : 0;
 
-    // 20-day rolling Sharpe, annualised (rf = 0). Requires at least
-    // 20 non-null returns in the window — for a freshly back-dated
-    // portfolio the first ~20 days are null on day 1 and 0 on
-    // holiday carries, so this gives a real value only once we have
-    // a solid month of real trading-day observations.
+    // 20-day rolling Sharpe, annualised (rf = 0). Window shrinks until we
+    // have at least 5 returns, then we report null to avoid misleading
+    // early numbers.
     let rollingSharpe: number | null = null;
     if (returns.length >= 20) {
       const window = returns.slice(-20);
@@ -377,14 +372,14 @@ export function PerformanceCharts({
                       return <g />;
                     }
                     const positive = value >= 0;
-                    // Recharts passes `height` as the rect's pixel
-                    // extent. For negative values some recharts
-                    // versions emit a negative `height` (rect grows
-                    // upward from `y`); clamping with `Math.max(..,1)`
-                    // then produced a 1px line instead of a bar.
-                    // Use the magnitude and anchor to the smaller `y`
-                    // (which is the bar's "outer" edge) so both
-                    // positive and negative bars render correctly.
+                    // Recharts passes `height` as the rect's pixel extent.
+                    // For negative values some recharts versions emit a
+                    // negative `height` (rect grows upward from `y`);
+                    // clamping with `Math.max(.., 1)` then produced a
+                    // 1px line instead of a bar. Use the magnitude and
+                    // anchor to the smaller `y` (the bar's "outer"
+                    // edge) so both positive and negative bars render
+                    // correctly.
                     const absHeight = Math.abs(height);
                     const barY = height >= 0 ? y : y - absHeight;
                     return (

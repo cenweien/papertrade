@@ -41,7 +41,9 @@ export function PortfolioEquityChart({
    * Annualized Sharpe ratio computed in `services/riskMetrics.ts` and
    * displayed as a header badge so the metric sits next to the curve
    * it describes. Null when the underlying return series has fewer
-   * than 2 points or zero variance.
+   * than 2 points or zero variance. Added when RiskPage started
+   * passing the metric down so Sharpe appears on the chart itself,
+   * not only in the MetricCard strip.
    */
   sharpeRatio?: number | null;
 }) {
@@ -66,25 +68,7 @@ export function PortfolioEquityChart({
   }
 
   return (
-    <div>
-      <div className="mb-2 flex items-center gap-2 text-xs">
-        <span className="uppercase tracking-wide text-slate-500">Sharpe</span>
-        <span
-          className={
-            sharpeRatio == null
-              ? 'text-slate-400'
-              : sharpeRatio >= 1
-                ? 'font-semibold text-emerald-600'
-                : sharpeRatio >= 0
-                  ? 'text-slate-700'
-                  : 'font-semibold text-red-600'
-          }
-        >
-          {sharpeRatio == null ? 'N/A' : sharpeRatio.toFixed(2)}
-        </span>
-        <span className="text-slate-400">· annualized (rfr 5%)</span>
-      </div>
-      <div className="h-72 w-full">
+    <div className="h-72 w-full">
       <ResponsiveContainer width="100%" height="100%">
         <AreaChart data={data} margin={{ top: 10, right: 16, left: 0, bottom: 0 }}>
           <defs>
@@ -151,7 +135,6 @@ export function PortfolioEquityChart({
           />
         </AreaChart>
       </ResponsiveContainer>
-      </div>
     </div>
   );
 }

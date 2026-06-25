@@ -35,6 +35,7 @@ import {
   getSnapshots,
   fillSnapshotGap,
   recomputeSnapshots,
+  isTradingDay,
   type Portfolio,
   type Position,
   type Trade,
@@ -122,7 +123,7 @@ export function RiskPage() {
 
   // ---- Load the selected portfolio's data ----
   const reloadData = async (id: string) => {
-    const [portfolio, positions, trades, snapshots] = await Promise.all([
+    const [portfolio, positions, trades, allSnapshots] = await Promise.all([
       getPortfolio(id),
       getPositions(id),
       getTrades(id, 500),
@@ -133,26 +134,27 @@ export function RiskPage() {
       setData(null);
       return;
     }
-    // Silently heal any gap in `daily_snapshots` between the latest
-    // existing row and the most recent trading day. Without this,
-    // portfolios with no recent trade show a flat carry-forward
-    // "right edge" on the equity curve even though live prices have
-    // been ticking via the Python scheduler. Runs AFTER getSnapshots
-    // and BEFORE re-reading them so the page that follows renders on
-    // the freshly-backfilled series.
+// Silently heal any gap in `daily_snapshots` between the latest
+    // existing row and the most recent trading day (merged from
+    // HEAD's pre-merge commit). Runs BEFORE the weekend filter so
+    // any freshly-written backfill rows are also filtered.
     try {
       await fillSnapshotGap(id);
     } catch (err) {
       console.warn('fillSnapshotGap failed (non-fatal):', err);
     }
     // Re-read snapshots so any rows written by fillSnapshotGap are
-    // included in the chart and risk metrics below.
-    let latestSnapshots = snapshots;
+    // included. Then filter out weekend / holiday rows — the
+    // backfill writes a row for every calendar day; weekends have
+    // no real price action and inflate the Sharpe window with
+    // zero-variance noise (merged from fix/weekend-filter-and-backfill-mark).
+    let latestSnapshots: DailySnapshot[] = allSnapshots;
     try {
       latestSnapshots = await getSnapshots(id, 365);
     } catch (err) {
       console.warn('snapshot re-read after gap-fill failed (non-fatal):', err);
     }
+    const snapshots = latestSnapshots.filter((s) => isTradingDay(s.snapshot_date));
     // Market-derived history series. Fetched AFTER the core data so
     // the page can render positions/trades immediately even if the
     // Bloomberg backfill is slow. A failure here is non-fatal —
