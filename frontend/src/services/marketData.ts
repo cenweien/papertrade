@@ -13,29 +13,16 @@
 
 import { useEffect, useState } from 'react';
 import { supabase } from '@/lib/supabase';
+import type { StockQuote } from './marketData.types';
+import * as Direct from './marketData.direct';
 
-const FN_BASE = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/market-data`;
+// VITE_DATA_MODE=direct routes all calls through the local bloomberg-service
+// relay instead of the Supabase Edge Function. See LOCAL_SETUP.md.
+const USE_DIRECT = (import.meta.env.VITE_DATA_MODE ?? '') === 'direct';
 
-export interface StockQuote {
-  ticker: string;
-  current_price: number;
-  previous_close: number | null;
-  change_pct: number | null;
-  day_high: number | null;
-  day_low: number | null;
-  day_open: number | null;
-  volume: number | null;
-  company_name: string | null;
-  sector: string | null;
-  asset_class?: string | null;
-  bbg_symbol?: string | null;
-  contract_size?: number | null;
-  currency?: string | null;
-  expiry_date?: string | null;
-  last_updated: string;
-  from_cache?: boolean;
-  _stale?: boolean;
-}
+const FN_BASE = `${import.meta.env.VITE_SUPABASE_URL ?? ''}/functions/v1/market-data`;
+
+export type { StockQuote };
 
 interface QuoteResponse {
   success: boolean;
@@ -68,7 +55,7 @@ async function getAuthHeader(): Promise<Record<string, string> | null> {
   if (!session?.access_token) return null;
   return {
     Authorization: `Bearer ${session.access_token}`,
-    apikey: import.meta.env.VITE_SUPABASE_ANON_KEY,
+    apikey: import.meta.env.VITE_SUPABASE_ANON_KEY ?? '',
   };
 }
 
@@ -77,6 +64,7 @@ async function getAuthHeader(): Promise<Record<string, string> | null> {
  * Returns null on error (caller should fall back to avg_price).
  */
 export async function getQuote(ticker: string): Promise<StockQuote | null> {
+  if (USE_DIRECT) return Direct.getQuote(ticker);
   const headers = await getAuthHeader();
   if (!headers) throw new Error('Not authenticated');
   const upper = ticker.trim().toUpperCase();
@@ -99,6 +87,7 @@ export async function getQuote(ticker: string): Promise<StockQuote | null> {
  * tickers and refreshes stale/missing ones. Up to 50 tickers per call.
  */
 export async function getQuotes(tickers: string[]): Promise<Record<string, StockQuote>> {
+  if (USE_DIRECT) return Direct.getQuotes(tickers);
   const headers = await getAuthHeader();
   if (!headers) throw new Error('Not authenticated');
   if (!tickers || tickers.length === 0) return {};
@@ -124,6 +113,7 @@ export async function getQuotes(tickers: string[]): Promise<Record<string, Stock
  * Force-refresh a single ticker, bypassing the cache.
  */
 export async function refreshQuote(ticker: string): Promise<StockQuote | null> {
+  if (USE_DIRECT) return Direct.refreshQuote(ticker);
   const headers = await getAuthHeader();
   if (!headers) throw new Error('Not authenticated');
   const upper = ticker.trim().toUpperCase();
@@ -146,6 +136,7 @@ export async function refreshQuote(ticker: string): Promise<StockQuote | null> {
  * Returns up to 10 common-stock matches.
  */
 export async function searchTickers(query: string): Promise<SearchResult[]> {
+  if (USE_DIRECT) return Direct.searchTickers(query);
   const headers = await getAuthHeader();
   if (!headers) throw new Error('Not authenticated');
   const q = query.trim();

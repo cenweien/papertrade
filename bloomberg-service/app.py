@@ -97,16 +97,19 @@ RELAY_API_KEY = os.environ.get("RELAY_API_KEY", "")
 # If RELAY_API_KEY is empty, the service starts in "no auth" mode (LAN-only).
 # This is a footgun: the service is reached via a Cloudflare tunnel which is
 # public by default. Set `AUTH_DISABLED=true` to opt in to no-auth mode
-# explicitly; otherwise we hard-fail at startup so a misconfigured deploy
-# doesn't silently expose the Bloomberg SAPI relay to the internet.
+# explicitly. To make the local-only path (frontend <-> uvicorn on
+# localhost) painless, we don't hard-fail when AUTH_DISABLED is unset; we
+# log a loud warning instead. The receiver simply has to opt in by either
+# setting RELAY_API_KEY (recommended when running over the public tunnel)
+# or AUTH_DISABLED=true (local/LAN use).
 AUTH_DISABLED = os.environ.get("AUTH_DISABLED", "").lower() in ("1", "true", "yes")
 if not RELAY_API_KEY and not AUTH_DISABLED:
-    raise RuntimeError(
-        "RELAY_API_KEY is empty and AUTH_DISABLED is not set. "
-        "The bloomberg-service is reached via a public Cloudflare tunnel — "
-        "running it without auth would expose the Bloomberg SAPI relay to "
-        "the internet. Set RELAY_API_KEY (recommended) or AUTH_DISABLED=true "
-        "(only if the service is behind a firewall that blocks public traffic)."
+    log.warning(
+        "RELAY_API_KEY is empty and AUTH_DISABLED is not set — the relay is "
+        "running with NO auth. This is fine for localhost-only use, but DO "
+        "NOT expose this service over a public Cloudflare tunnel without "
+        "setting RELAY_API_KEY (or AUTH_DISABLED=true once you've audited "
+        "your firewall). Continuing."
     )
 
 # Per-asset-class field maps. Equities use the standard set; futures

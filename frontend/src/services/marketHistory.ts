@@ -12,18 +12,15 @@
 // `buildMarketPortfolioReturns`).
 
 import { supabase } from '@/lib/supabase';
+import type { HistorySeries, HistoryPoint } from './marketData.types';
+import * as Direct from './marketData.direct';
 
-const FN_BASE = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/market-data`;
+// VITE_DATA_MODE=direct routes through the local relay instead of Supabase.
+const USE_DIRECT = (import.meta.env.VITE_DATA_MODE ?? '') === 'direct';
 
-export interface HistoryPoint {
-  trade_date: string;     // YYYY-MM-DD
-  close: number;
-}
+const FN_BASE = `${import.meta.env.VITE_SUPABASE_URL ?? ''}/functions/v1/market-data`;
 
-export interface HistorySeries {
-  ticker: string;
-  points: HistoryPoint[];
-}
+export type { HistoryPoint, HistorySeries };
 
 interface HistorySeriesResponse {
   success: boolean;
@@ -40,7 +37,7 @@ async function getAuthHeader(): Promise<Record<string, string> | null> {
   if (!session?.access_token) return null;
   return {
     Authorization: `Bearer ${session.access_token}`,
-    apikey: import.meta.env.VITE_SUPABASE_ANON_KEY,
+    apikey: import.meta.env.VITE_SUPABASE_ANON_KEY ?? '',
   };
 }
 
@@ -55,6 +52,7 @@ export async function getHistorySeries(
   start: string,
   end: string,
 ): Promise<HistorySeries[]> {
+  if (USE_DIRECT) return Direct.getHistorySeries(tickers, start, end);
   const headers = await getAuthHeader();
   if (!headers) throw new Error('Not authenticated');
   const cleaned = (tickers ?? [])

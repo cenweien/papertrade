@@ -1,12 +1,23 @@
 // LoginPage - Anonymous sign-in (no email required)
 import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { supabase } from '@/lib/supabase';
+import { isMockAuth } from '@/lib/mockAuth';
 
 export function LoginPage() {
+  const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const handleSignIn = async () => {
+    if (isMockAuth()) {
+      navigate('/');
+      return;
+    }
+    if (!supabase) {
+      setError('Supabase not configured. See LOCAL_SETUP.md.');
+      return;
+    }
     setLoading(true);
     setError(null);
     try {

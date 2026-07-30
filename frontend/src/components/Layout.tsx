@@ -2,6 +2,7 @@
 import { ReactNode, useState, useEffect } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { supabase } from '@/lib/supabase';
+import { isMockAuth } from '@/lib/mockAuth';
 import { LayoutDashboard, MessageSquare, BarChart3, Flame, LogOut, Plus, ShieldAlert } from 'lucide-react';
 import { ensureDefaultPortfolio, type Portfolio } from '@/services/db';
 
@@ -15,7 +16,13 @@ export function Layout({ children }: { children: ReactNode }) {
   }, []);
 
   const handleSignOut = async () => {
-    await supabase.auth.signOut();
+    // In mock auth there's no real session to clear; just hard-navigate to /
+    // so the user can re-trigger the app shell.
+    if (isMockAuth()) {
+      navigate('/');
+      return;
+    }
+    if (supabase) await supabase.auth.signOut();
     navigate('/login');
   };
 
